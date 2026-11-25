@@ -6,6 +6,7 @@ import 'package:screen_retriever/screen_retriever.dart';
 import 'package:window_manager/window_manager.dart';
 import '../../../core/config/config_repository.dart';
 import '../../../core/config/models/desktop_window_config.dart';
+import '../../../core/diagnostics/app_logger.dart';
 import 'window_geometry_guard.dart';
 
 /// Windows 桌面原生窗口生命周期与几何形态管理控制器
@@ -320,7 +321,8 @@ class DesktopWindowManager with WindowListener {
     }
     try {
       await beforeClose?.call().timeout(beforeCloseTimeout, onTimeout: () {
-        debugPrint('[xiugou-tv] 退出钩子超过 ${beforeCloseTimeout.inSeconds}s 未完成，继续关闭窗口');
+        AppLogger.instance.warning(
+            'window', '退出钩子超过 ${beforeCloseTimeout.inSeconds}s 未完成，继续关闭窗口');
       });
       await _flushPersistWindowGeometry();
       await windowManager.destroy();
@@ -364,7 +366,8 @@ class DesktopWindowManager with WindowListener {
   @override
   void onWindowClose() {
     unawaited(close().catchError((Object error, StackTrace stack) {
-      debugPrint('[xiugou-tv] close failed; window kept open: $error\n$stack');
+      AppLogger.instance.error('window', '窗口关闭失败，保持窗口可重试',
+          error: error, stack: stack);
     }));
   }
 

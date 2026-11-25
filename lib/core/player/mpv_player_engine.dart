@@ -1,11 +1,17 @@
 import 'dart:async';
 import 'package:flutter/foundation.dart';
+import 'dart:io';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
+import 'package:path/path.dart' as p;
 import 'decode_diagnostics.dart';
 import 'embedded_playback.dart';
 import 'live_stream_tuning.dart';
 import 'local_subtitle_files.dart';
+import '../cache/video_cache_store.dart';
+import '../diagnostics/app_logger.dart';
+import '../settings/models/video_cache_preferences.dart';
+import 'media_recorder.dart';
 import 'models/player_settings.dart';
 import 'models/player_state.dart';
 import 'models/track_info.dart';
@@ -13,6 +19,7 @@ import 'playback_diagnostics.dart';
 import 'playback_error_gate.dart';
 import 'playback_error_text.dart';
 import 'playback_http_headers.dart';
+import 'playback_url_validator.dart';
 import 'player_engine.dart';
 import 'player_track_capabilities.dart';
 import 'player_settings_application.dart';
@@ -83,6 +90,9 @@ class MpvPlayerEngine
   MediaPlaySpec? _currentSpec;
   /// 已经为这次会话做过「同一地址自动重开」的 spec；同一会话只重试一次。
   MediaPlaySpec? _softRetrySpec;
+
+  /// 正在回源诊断失败原因（避免重复拉取中转地址）。
+  bool _diagnosing = false;
   List<TrackInfo> _audioTracks = [];
   List<TrackInfo> _subtitleTracks = [];
   int _subtitleRead = 0;
@@ -92,6 +102,12 @@ class MpvPlayerEngine
   String? _subtitleCodec;
   final _sourceSubtitleIds = <int, String>{};
   List<TrackInfo> _videoTracks = [];
+
+  /// 本地缓存下载器：与播放状态无关，暂停 / 拖动不影响下载。
+  @override
+  final VideoCacheStore cacheStore = VideoCacheStore();
+  String _cacheDefaultRoot = '';
+  Timer? _cacheReanchorTimer;
 
   /// ④ 诊断闭环：mpv 最近日志环形缓冲（40 条），供错误面板展示与「复制诊断」。
   final RecentLogBuffer _recentLogs = RecentLogBuffer();
@@ -108,6 +124,30 @@ class MpvPlayerEngine
   final _subtitleTracksController =
       StreamController<List<TrackInfo>>.broadcast();
   final _videoTracksController = StreamController<List<TrackInfo>>.broadcast();
+
+  // --- 录制（纯 Dart 源下载：media_kit 的 libmpv 精简构建无 muxer，
+  //     mpv 自带录制不可用，见 MediaRecorder 文件头说明） ---
+  bool _recording = false;
+  String? _recordingPath;
+  MediaRecorder? _recorder;
+
+  /// 用户**主动**终止录制。用来区分「源断了」与「我自己停的」——
+  /// 后者走 `stopRecording()` 的下发路径，不应额外提示「录制已结束」。
+  bool _recordingStopRequested = false;
+
+  /// 「从当前进度开始录」的尾部豁免区间：剩余不足这个时长时改为从头录。
+  /// 直播（时长恒为 0）与直链不受影响——它们本来就不按偏移裁剪。
+  static const Duration _recordTailGuard = Duration(seconds: 60);
+
+  final _recordingController = StreamController<bool>.broadcast();
+
+  /// 录制**意外**结束（源断开 / 直播断流）时的面向用户的原因。
+  /// 用户主动点停止、换源导致的中止都不会发。
+  final _recordingEndedController = StreamController<String>.broadcast();
+
+  /// 录制任务自然结束时的播报（点播清单下完 / 直链读到流尾）。
+  /// 与 [recordingEndedStream] 分开：一个是「录完了」，一个是「断了」。
+  final _recordingFinishedController = StreamController<String>.broadcast();
 
   final List<StreamSubscription> _subscriptions = [];
 
@@ -213,19 +253,42 @@ class MpvPlayerEngine
       _bindNativeStreams();
       await _observeNativeSeekCompletion();
       await settingsApplication.attach(MpvSettingsTarget(_player));
+      AppLogger.instance.info('player', 'mpv 引擎初始化完成');
       // ④：显式钉住网络连接超时（mpv 默认即 60s）——直播源失联时保证约 60s
       // 内进入错误态并可诊断，而不是无限等待；个别发行版 / 配置可能覆写该值。
       try {
         final platform = _player.platform;
         if (platform is NativePlayer) {
           await platform.setProperty('network-timeout', '60');
+          // 缓存相关 mpv 属性：`cache-on-disk=yes` 会把网络缓存落到磁盘，
+          // 分片源在机械盘 / 高码率下表现为周期性卡顿；改成纯内存缓存并加大预读。
+          await _applyCacheTweaks();
         }
       } catch (_) {
         // 属性不可用时不影响播放主链路。
       }
-    } catch (_) {
+    } catch (error, stack) {
       settingsApplication.initializationFailed();
+      AppLogger.instance.error('player', 'mpv 引擎初始化失败',
+          error: error, stack: stack);
       rethrow;
+    }
+  }
+
+  Future<void> _applyCacheTweaks() async {
+    try {
+      final platform = _player.platform;
+      if (platform is! NativePlayer) return;
+      for (final entry in const <String, String>{
+        'cache-on-disk': 'no',
+        'demuxer-readahead-secs': '30',
+        'demuxer-max-bytes': '64MiB',
+        'demuxer-max-back-bytes': '32MiB',
+      }.entries) {
+        await platform.setProperty(entry.key, entry.value);
+      }
+    } catch (_) {
+      // 属性不可用时不影响播放主链路。
     }
   }
 
@@ -387,6 +450,15 @@ class MpvPlayerEngine
       }),
     );
 
+    // 轨道列表与「当前选中」是两条独立的流。`sub-add` / 切轨时 mpv 先发
+    // track-list、后发 current-tracks，只在上面那个回调里读 `state.track`
+    // 拿到的是旧值——外挂字幕已经在画面上渲染，菜单里勾着的却还是「关闭字幕」。
+    _subscriptions.add(
+      _player.stream.track.listen((_) {
+        _resyncTrackSelection();
+      }),
+    );
+
     _subscriptions.add(
       _player.stream.track.listen((track) {
         if (!_acceptMediaEvents) return;
@@ -495,6 +567,9 @@ class MpvPlayerEngine
   void _commitError(String err) {
     if (_disposed || !_mpvOwnsPlayback || _externalPlaybackPaused || _hasPendingSeek) return;
     if (_scheduleLiveReconnect()) return;
+    // 网络瞬断（CDN 掐 TCP 连接）先静默自动重连；重试窗口内的重复报错一并吞掉
+    // （一次失败 mpv 会连发多条 error），超出次数或非瞬断错误才落错误面板。
+    if (_autoRetryPending || _maybeAutoRetry(err)) return;
     // 传输中断（清单/分段没读全）多为瞬时问题：同一地址先自动重开一次，再判失败。
     if (_shouldSoftRetry(err)) {
       _softRetrySpec = _currentSpec;
@@ -512,8 +587,15 @@ class MpvPlayerEngine
       }
     }
     _currentError = err;
+    AppLogger.instance.warning(
+        'player', '播放错误：${err.replaceAll(RegExp(r'\s+'), ' ')}');
     _errorController.add(err);
     _updateStatus(PlaybackStatus.error);
+    // 内容级失败（格式无法识别 / 读到纯文本播放列表等）多半是「解析中转把错误页当视频回传」，
+    // 回源诊断一次，把真实原因（如「秘钥不存在」）覆盖到错误面板。
+    if (!_diagnosing && _contentErrorPattern.hasMatch(err)) {
+      _diagnoseContentError();
+    }
   }
 
   /// 是否值得「同一地址再开一次」：只针对传输中断，且每个会话只做一次。
@@ -523,6 +605,153 @@ class MpvPlayerEngine
     if (identical(_softRetrySpec, spec)) return false;
     final text = err.toLowerCase();
     return text.contains('stream ends prematurely') || text.contains('ffurl_read');
+  }
+
+  /// 列表里的这条字幕轨，是否就是当前正在用的那条。
+  ///
+  /// 外挂字幕必须特殊对齐：`SubtitleTrack.uri` 的 `id` 是文件路径，而 mpv 的
+  /// track-list 给同一条轨发的是数字 sid，两者永不相等——不认回来的话，
+  /// 字幕明明在画面上跑，面板却显示「已关闭」。加载时我们把 title 写成了
+  /// 文件名，只能靠它对齐。
+  bool _subtitleSelected(String id, String? title) {
+    final selected = _player.state.track.subtitle;
+    if (id == selected.id) return true;
+    final isPath = selected.id.contains('/') || selected.id.contains(r'\');
+    return isPath && p.basename(selected.id) == title;
+  }
+
+  /// 用最新的 `state.track` 重算三条列表的选中态并重新推送。
+  /// 只在「确实有变化」时发事件，避免每次选中流都让三个菜单重建。
+  void _resyncTrackSelection() {
+    final selected = _player.state.track;
+    List<TrackInfo>? nextAudio;
+    List<TrackInfo>? nextSubtitle;
+    List<TrackInfo>? nextVideo;
+    void sync(List<TrackInfo> current, bool Function(TrackInfo) hit,
+        void Function(List<TrackInfo>) assign) {
+      if (!current.any((t) => t.isSelected != hit(t))) return;
+      assign(current
+          .map((t) => TrackInfo(
+                id: t.id,
+                type: t.type,
+                title: t.title,
+                language: t.language,
+                isSelected: hit(t),
+              ))
+          .toList());
+    }
+
+    sync(_audioTracks, (t) => t.id == selected.audio.id, (v) => nextAudio = v);
+    sync(
+        _subtitleTracks,
+        (t) => _subtitleSelected(t.id, t.title),
+        (v) => nextSubtitle = v);
+    sync(_videoTracks, (t) => t.id == selected.video.id, (v) => nextVideo = v);
+
+    if (nextAudio != null) {
+      _audioTracks = nextAudio!;
+      _audioTracksController.add(_audioTracks);
+    }
+    if (nextSubtitle != null) {
+      _subtitleTracks = nextSubtitle!;
+      _subtitleTracksController.add(_subtitleTracks);
+    }
+    if (nextVideo != null) {
+      _videoTracks = nextVideo!;
+      _videoTracksController.add(_videoTracks);
+    }
+  }
+
+  // ---------------- 自动重试（网络瞬断） ----------------
+
+  /// 本次播放会话已自动重试的次数（用户重新起播时清零）。
+  int _autoRetryCount = 0;
+
+  /// 有一条自动重试在途中（防抖：一次失败 mpv 可能连发多条 error）。
+  bool _autoRetryPending = false;
+
+  /// 自动重试上限：连续两次仍瞬断就交给错误面板，避免无限打转。
+  static const int _maxAutoRetries = 2;
+
+  /// 自动重试前的等待：给 CDN / 本地网络一点恢复时间。
+  static const Duration _autoRetryDelay = Duration(milliseconds: 1500);
+
+  /// 瞬断特征：mpv/libmpv 在 Windows 上把 Winsock 错误码以十六进制冒出来，
+  /// `0xffffd8ba` = -10054 WSAECONNRESET（连接被对端重置）、
+  /// `0xffffd8bb` = -10053 WSAECONNABORTED。免费 CDN 限速 / 踢连接时高发，
+  /// 重新打开同一地址通常立刻恢复。
+  static final RegExp _transientNetworkError = RegExp(
+      r'ffurl_(read|write) returned 0x|connection reset|connection aborted|timed?\s?out',
+      caseSensitive: false);
+
+  /// 内容级失败特征：mpv 把中转返回的错误页（HTML/JSON/纯文本）当成媒体打开时，
+  /// 会报「无法识别格式 / 读到纯文本播放列表」。这类最可能是解析中转返回了错误而非视频流。
+  static final RegExp _contentErrorPattern = RegExp(
+      r'recognize file format|plaintext playlist|no playable streams|invalid (?:data|format)|unsupported format',
+      caseSensitive: false);
+
+  /// 播放失败后最佳努力回源诊断：拉取一次中转地址，若其返回的是错误页（HTML/JSON），
+  /// 用真实原因（如「秘钥不存在」）覆盖错误面板的文案。仅在播放已失败、且当前规格仍处错误态时生效，
+  /// 因此不会影响任何正在进行的播放，也不会消耗可用线路的令牌。
+  void _diagnoseContentError() {
+    final spec = _currentSpec;
+    if (spec == null || spec.isLive || _diagnosing || _disposed) return;
+    final uri = Uri.tryParse(spec.url);
+    if (uri == null || (uri.scheme != 'http' && uri.scheme != 'https')) return;
+    _diagnosing = true;
+    unawaited(() async {
+      try {
+        final reason =
+            await diagnosePlaybackUrl(spec.url, headers: spec.headers);
+        if (reason != null && !_disposed && _status == PlaybackStatus.error) {
+          _currentError = reason;
+          _errorController.add(reason);
+          // 强制刷新错误面板：它随 statusStream 重建并读取 currentError；
+          // 同时让自动换线把本次失败归类为「永久错误」从而立即换线。
+          _statusController.add(_status);
+        }
+      } finally {
+        _diagnosing = false;
+      }
+    }());
+  }
+
+  /// 判断 [err] 是否值得自动重试；是则安排一次断点续播并返回 true。
+  bool _maybeAutoRetry(String err) {
+    final spec = _currentSpec;
+    if (spec == null || _disposed) return false;
+    if (_autoRetryCount >= _maxAutoRetries) return false;
+    if (!_transientNetworkError.hasMatch(err)) return false;
+    _autoRetryCount++;
+    _autoRetryPending = true;
+    AppLogger.instance.info('player',
+        '瞬断自动重试（第 $_autoRetryCount/$_maxAutoRetries 次），从断点续播');
+    // 从最后一个已知位置续播：错误发生时播放已停，位置不再推进。
+    final resumeMs = _position.inMilliseconds;
+    _currentError = null;
+    _errorController.add(null);
+    _updateStatus(PlaybackStatus.buffering);
+    unawaited(() async {
+      try {
+        await Future<void>.delayed(_autoRetryDelay);
+        if (_disposed) return;
+        // 直播没有「断点」：start 会让 mpv 尝试定位到滑动窗口里已经不存在的时刻，
+        // 重试因此卡住或直接失败。直播一律重新接入。
+        final retrySpec = MediaPlaySpec(
+          url: spec.url,
+          headers: spec.headers,
+          title: spec.title,
+          isLive: spec.isLive,
+          startPosition: (!spec.isLive && resumeMs > 0)
+              ? Duration(milliseconds: resumeMs)
+              : null,
+        );
+        await _open(retrySpec);
+      } finally {
+        _autoRetryPending = false;
+      }
+    }());
+    return true;
   }
 
   void _cancelErrorConfirm() {
@@ -543,6 +772,8 @@ class MpvPlayerEngine
     final epoch = _sessionEpoch;
     _recentLogs.add('[reconnect] 直播断流，${delay.inSeconds}s 后第 '
         '${_liveReconnect.attempts} 次重连');
+    AppLogger.instance.info('player',
+        '直播断流，${delay.inSeconds}s 后第 ${_liveReconnect.attempts} 次重连');
     _updateStatus(PlaybackStatus.buffering);
     _reconnectTimer = Timer(delay, () {
       _reconnectTimer = null;
@@ -672,6 +903,12 @@ class MpvPlayerEngine
       );
       openedUri = media.uri;
       _openedMediaUri = openedUri;
+      // 本地缓存（旁路）：失败绝不影响播放，因此不等待也不捕获到播放链路
+      if (_cacheDefaultRoot.isNotEmpty) {
+        _cacheReanchorTimer?.cancel();
+        _cacheReanchorTimer = null;
+        unawaited(cacheStore.start(spec, defaultRoot: _cacheDefaultRoot));
+      }
       await _player.open(media, play: play);
     } finally {
       if (_isCurrentSession(epoch) && openEpoch == _openEpoch) {
@@ -754,8 +991,20 @@ class MpvPlayerEngine
   @override
   Future<void> play(MediaPlaySpec spec) async {
     if (_disposed) throw StateError('播放器已关闭');
+    // 换源 / 换线自动终止上一会话的录制（已写内容保留为不完整文件）；
+    // MediaRecorder.stop 会等后台下载循环真正退出，再进新会话，
+    // 避免新旧录制器抢同一批 HTTP 连接与文件句柄。
+    if (_recording) {
+      try {
+        await stopRecording();
+      } catch (_) {
+        // 清理失败不阻塞起播。
+      }
+    }
     final epoch = ++_sessionEpoch;
     final closing = _retireEmbedded();
+    AppLogger.instance.info('player',
+        '开始播放：${spec.title}（${spec.isLive ? '直播' : '点播'}）');
     _cancelLiveReconnect();
     _cancelErrorConfirm();
     _pauseIntent = false;
@@ -765,6 +1014,10 @@ class MpvPlayerEngine
     _currentError = null;
     _errorController.add(null);
     _resetMediaEvidence();
+    // 用户主动起播 = 新会话：自动重试计数与诊断状态归零。
+    _autoRetryCount = 0;
+    _autoRetryPending = false;
+    _diagnosing = false;
     // 每次新播放会话重置诊断日志，避免上一部片的日志混进本次错误诊断。
     _recentLogs.clear();
     // 播放模式与来源 / 依据（探测结果、回退原因）写进诊断日志：
@@ -886,6 +1139,14 @@ class MpvPlayerEngine
   @override
   Future<void> stop() async {
     if (_disposed) return;
+    AppLogger.instance.info('player', '停止播放');
+    if (_recording) {
+      try {
+        await stopRecording();
+      } catch (_) {
+        // 停止播放为主目标，录制清理失败不阻断。
+      }
+    }
     final epoch = ++_sessionEpoch;
     _openEpoch++;
     final closing = _retireEmbedded();
@@ -908,6 +1169,9 @@ class MpvPlayerEngine
     }
     await _player.stop();
     if (!_isCurrentSession(epoch)) return;
+    _cacheReanchorTimer?.cancel();
+    _cacheReanchorTimer = null;
+    cacheStore.stop();
     _updateStatus(PlaybackStatus.idle);
   }
 
@@ -938,6 +1202,8 @@ class MpvPlayerEngine
     final generation = _seekRecovery.begin(
         originalPosition: originalPosition, targetPosition: target);
     try {
+      // 本地缓存：seek 后重锚下载前沿到新位置（失败不影响 seek）。
+      _reanchorCacheAfterSeek(target);
       await _player.seek(target);
       if (!_isCurrentSession(epoch) ||
           _seekRecovery.value.generation != generation) {
@@ -1029,6 +1295,36 @@ class MpvPlayerEngine
         _recentLogs.add('[seek-evidence] $error');
       }
     }
+  }
+
+  /// 跳到缓存前沿之后时，把缓存任务的锚点挪到新位置。
+  ///
+  /// 缓存按「起播位置 → 片尾 → 回头补前缀」的顺序下，锚点定在起播那一刻。
+  /// 用户一把拖到 40 分钟处（前沿才 6 分钟），下载仍在老锚点后方爬：新位置
+  /// 只能走网络，看起来就像「缓存开着却没生效」，同时还继续下着没人看的前方分片。
+  void _reanchorCacheAfterSeek(Duration position) {
+    if (_disposed || _cacheDefaultRoot.isEmpty) return;
+    final spec = _currentSpec;
+    if (spec == null || !cacheStore.isRunning) return;
+    // 前沿之前（含一点余量）已经缓存过，重锚只会白扔掉当前任务的进度。
+    if (position.inMilliseconds <= cacheStore.progress.frontierMs + 30 * 1000) {
+      return;
+    }
+    _cacheReanchorTimer?.cancel();
+    _cacheReanchorTimer = Timer(const Duration(milliseconds: 600), () {
+      final current = _currentSpec;
+      if (_disposed || current == null || current.url != spec.url) return;
+      unawaited(cacheStore.start(
+        MediaPlaySpec(
+          url: current.url,
+          headers: current.headers,
+          title: current.title,
+          isLive: current.isLive,
+          startPosition: position,
+        ),
+        defaultRoot: _cacheDefaultRoot,
+      ));
+    });
   }
 
   @override
@@ -1223,6 +1519,14 @@ class MpvPlayerEngine
   }
 
   @override
+  Future<void> addSubtitleFile(String path) async {
+    // media_kit 1.2.6 没有公开的 openSubtitle：SubtitleTrack.uri 会走 mpv 的
+    // `sub-add <path> select <title> <lang>`，加载即选中，并作为新字幕轨进轨道列表。
+    await _player.setSubtitleTrack(
+        SubtitleTrack.uri(path, title: p.basename(path)));
+  }
+
+  @override
   Future<void> selectVideoTrack(TrackInfo track) async {
     if (!_mpvOwnsPlayback) return;
     final VideoTrack native;
@@ -1249,6 +1553,13 @@ class MpvPlayerEngine
   @override
   Future<void> dispose() async {
     if (_disposed) return;
+    if (_recording) {
+      try {
+        await stopRecording();
+      } catch (_) {
+        // 退出流程中录制清理失败不阻断资源释放。
+      }
+    }
     _disposed = true;
     _sessionEpoch++;
     _openEpoch++;
@@ -1258,6 +1569,9 @@ class MpvPlayerEngine
     _seekRecovery.dispose();
     _cancelLiveReconnect();
     _cancelErrorConfirm();
+    _cacheReanchorTimer?.cancel();
+    _cacheReanchorTimer = null;
+    await cacheStore.dispose();
     await settingsApplication.dispose();
     if (closing != null) {
       try {
@@ -1283,6 +1597,116 @@ class MpvPlayerEngine
     await _audioTracksController.close();
     await _subtitleTracksController.close();
     await _videoTracksController.close();
+    await _recordingController.close();
+    await _recordingEndedController.close();
+    await _recordingFinishedController.close();
+  }
+
+  // ==================== 录制 ====================
+
+  @override
+  bool get isRecording => _recording;
+
+  @override
+  Stream<bool> get recordingStream => _recordingController.stream;
+
+  Stream<String> get recordingEndedStream => _recordingEndedController.stream;
+
+  Stream<String> get recordingFinishedStream =>
+      _recordingFinishedController.stream;
+
+  /// 录制后台任务结束（点播清单下完 / 直播轮询被停）时，由 [startRecording]
+  /// 挂的监听回调调用。用户没点停止，说明是后台自己结束的——要么是正常
+  /// 录完（点播），要么是源断了（直播断流 / 中途报错），两者提示必须分开。
+  void _onRecorderFinished(MediaRecorder recorder) {
+    if (!_recording || _recordingStopRequested) return;
+    final path = _recordingPath;
+    // 先复位状态，UI 按钮随即回到「开始录制」。
+    _recorder = null;
+    _recording = false;
+    _recordingPath = null;
+    if (!_recordingController.isClosed) _recordingController.add(false);
+    if (recorder.completed) {
+      // 点播下完是正常结束，绝不能报成故障。
+      if (!_recordingFinishedController.isClosed) {
+        _recordingFinishedController
+            .add(path == null ? '录制完成' : '录制完成：$path');
+      }
+      return;
+    }
+    // 已写入的部分仍是可用的分片流（直播尤其常见），照常保留并提示用户。
+    final reason = path == null
+        ? '录制已结束：视频源已断开'
+        : '录制已结束：视频源已断开，已保留部分文件：$path';
+    if (!_recordingEndedController.isClosed) {
+      _recordingEndedController.add(reason);
+    }
+  }
+
+  @override
+  Future<void> startRecording(String path, {Duration? from}) async {
+    if (_recording) throw StateError('已经在录制中');
+    final spec = _currentSpec;
+    if (spec == null || spec.url.isEmpty) throw StateError('当前没有正在播放的内容');
+    // 目标目录必须先建好，否则文件根本落不了盘。
+    try {
+      Directory(File(path).parent.path).createSync(recursive: true);
+    } catch (e) {
+      throw StateError('无法创建录制目录：$e');
+    }
+    // 直接抓播放源：HLS 逐分片拼接 / 直链字节 dump。start() 返回时
+    // 文件里已有真实字节，失败会抛出面向用户的错误信息。
+    // from = 当前播放位置：点播从「正在看的地方」开始录（跳过贴片广告）。
+    final fromMs = from?.inMilliseconds ?? 0;
+    final durationMs = _duration.inMilliseconds;
+    // 片尾 / 已播完时不要按当前位置起录：HLS 只会剩下最后一个分片，
+    // 产物只有几秒，而且对「想留存这一集」的用户毫无价值。
+    final tooLate = fromMs > 0 && durationMs > 0
+        ? fromMs >= durationMs - _recordTailGuard.inMilliseconds
+        : false;
+    final recorder = MediaRecorder(
+      url: spec.url,
+      outputPath: path,
+      headers: spec.headers,
+      startOffset: tooLate ? Duration.zero : (from ?? Duration.zero),
+    );
+    try {
+      await recorder.start();
+    } catch (_) {
+      await recorder.stop(); // 失败即收尾，避免后台任务悬挂
+      rethrow;
+    }
+    _recorder = recorder;
+    _recording = true;
+    _recordingPath = path;
+    _recordingStopRequested = false;
+    // 后台任务自己结束（点播下完 / 直播断流）时通知 UI：否则按钮永远停在
+    // 「停止录制」，用户只能反复点停止才可能发现录制早就不在跑了。
+    // done 在 stop() 之后也会完成，此时 _recordingStopRequested 已拦住提示。
+    unawaited(recorder.done.whenComplete(() => _onRecorderFinished(recorder)));
+    if (!_recordingController.isClosed) _recordingController.add(true);
+  }
+
+  @override
+  Future<String?> stopRecording() async {
+    if (!_recording) return null;
+    final path = _recordingPath;
+    final recorder = _recorder;
+    // 先立旗：recorder.stop() 会让 done 完成，回调里据此跳过「意外结束」提示
+    // （用户点停止、换源中止都属于「我让它停的」）。
+    _recordingStopRequested = true;
+    _recorder = null;
+    _recording = false;
+    _recordingPath = null;
+    if (recorder != null) {
+      try {
+        await recorder.stop();
+      } catch (_) {
+        // 停止失败的兜底：客户端已强制关闭，文件保留已写入部分。
+      }
+    }
+    if (!_recordingController.isClosed) _recordingController.add(false);
+    return path;
   }
 
   // --- 快照属性 ---
@@ -1304,6 +1728,21 @@ class MpvPlayerEngine
   String? get currentError => _currentError;
   @override
   MediaPlaySpec? get currentSpec => _currentSpec;
+
+  /// 应用视频缓存偏好；记住默认根目录，之后的每次起播都会用它启动缓存任务。
+  @override
+  Future<void> applyCachePreferences(VideoCachePreferences preferences,
+      {required String defaultRoot}) async {
+    _cacheDefaultRoot = defaultRoot;
+    await cacheStore.applyPreferences(preferences, defaultRoot: defaultRoot);
+  }
+
+  @override
+  VideoCacheProgress get cacheProgress => cacheStore.progress;
+
+  @override
+  Stream<VideoCacheProgress> get cacheProgressStream =>
+      cacheStore.progressStream;
 
   /// 最近 40 条引擎日志（④ 诊断闭环；只读快照，供错误面板展示与复制）。
   List<String> get recentPlayerLogs => _mpvOwnsPlayback ? _recentLogs.entries : const [];

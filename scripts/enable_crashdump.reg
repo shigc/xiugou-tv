@@ -1,0 +1,19 @@
+Windows Registry Editor Version 5.00
+
+; 为 xiugou_tv.exe 配置 Windows Error Reporting 本地 full dump。
+; 导入后，下次程序原生崩溃会自动在 C:\crashdumps 生成 .dmp，
+; 用 Visual Studio 或 WinDbg 打开即可看到崩溃调用栈（定位 0xc0000409 的具体函数）。
+;
+; 使用方法（需管理员权限）：
+;   1. 先创建目录：mkdir C:\crashdumps
+;   2. 右键本文件 → 合并（或 regedit 导入）；UAC 选"是"。
+;   3. 正常运行 xiugou_tv.exe 直到再次闪退。
+;   4. 到 C:\crashdumps 取最新的 .dmp 分析。
+;
+; 清理（不再需要抓 dump 时）：
+;   删除注册表项 HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\xiugou_tv.exe
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\xiugou_tv.exe]
+"DumpFolder"="C:\\crashdumps"
+"DumpType"=dword:00000002
+"DumpCount"=dword:00000010

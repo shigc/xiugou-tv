@@ -1,10 +1,10 @@
 import 'dart:async';
 import 'dart:convert';
 import 'package:dio/dio.dart';
-import 'package:flutter/foundation.dart' show debugPrint;
 import '../api/models/vod_models.dart';
 import '../api/search_cancel_token.dart';
 import '../config/models/vod_config.dart';
+import '../diagnostics/app_logger.dart';
 import '../net/http_client_factory.dart';
 import '../net/site_icon_url.dart';
 import '../player/models/player_state.dart';
@@ -305,8 +305,8 @@ class CompanionSpiderApi {
       params: {'flag': flag, 'id': id},
     );
     if (raw.trim().isEmpty) {
-      debugPrint(
-          '--> [播放地址为空] ${describeEmptyPlayResult(site.key, flag, id, raw)}');
+      AppLogger.instance.warning(
+          'spider', describeEmptyPlayResult(site.key, flag, id, raw));
       throw const FormatException('Spider 未返回播放地址');
     }
     dynamic decoded;
@@ -320,8 +320,8 @@ class CompanionSpiderApi {
     final selection = _readSpiderQualities(decoded['url']);
     final qualities = selection.qualities;
     if (qualities.isEmpty) {
-      debugPrint(
-          '--> [播放地址为空] ${describeEmptyPlayResult(site.key, flag, id, raw)}');
+      AppLogger.instance.warning(
+          'spider', describeEmptyPlayResult(site.key, flag, id, raw));
       // 网盘载荷没给地址时常在 msg 里说明原因（如「还没有配置百度网盘 Cookie」），
       // 原样交给用户，比笼统的「站源没有返回播放地址」更能指明下一步。
       final hint = playResultHint(decoded);
@@ -702,6 +702,39 @@ class CompanionSpiderApi {
 }
 
 /// 从 playerContent 的地址、数组或 values/position 对象取默认档地址。
+/// 伴随服务 RPC 失败：与「站点确实没内容」区分开。
+///
+/// 曾经进程没起、503 过载、看门狗 504、HTTP 500 全塌成空串，于是「companion 挂了」
+/// 在 UI 上表现为「这个源没有数据」，排查无从下手（AGENTS.md §7 的「部分站点播放报错」）。
+class CompanionRpcException implements Exception {
+  const CompanionRpcException(this.message, {this.stage, this.detail});
+
+  /// 面向用户的一句话原因。
+  final String message;
+
+  /// companion 侧的失败阶段（见服务端 ParseStage），可为空。
+  final String? stage;
+
+  /// 技术细节（原始 error / 超时预算），只进日志、不进弹窗。
+  final String? detail;
+
+  @override
+  String toString() {
+    final buffer = StringBuffer(message);
+    if (stage?.isNotEmpty == true) buffer.write('（阶段 $stage）');
+    // toString 是给日志看的，所以带上 detail；界面读的是 message + stage。
+    if (detail?.isNotEmpty == true) buffer.write(' detail=$detail');
+    return buffer.toString();
+  }
+}
+
+/// Spider 返回的播放意图；需要解析的页面地址不能直接交给播放器。
+/// 从 playerContent 的 `url` 字段取实际播放地址。
+///
+/// FongMi / TVBox 允许 `url` 是多清晰度数组 `[名称, 地址, 名称, 地址, ...]`
+/// （嗷呜「嗷嗚┃动漫」返回 `["4K", ..., "1080P", ...]`）。以前只认字符串，这类站源一律
+/// 报「Spider 未返回播放地址」。现在与 FongMi 默认一致取第一档；数组里只有地址（无名称）
+/// 时取第一个像地址的元素。都取不到返回 null。
 String? selectSpiderPlayUrl(Object? raw) {
   final selection = _readSpiderQualities(raw);
   return selection.qualities.isEmpty

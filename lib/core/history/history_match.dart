@@ -36,6 +36,11 @@ const _movieMarkers = {'正片', 'hd', '高清', '完整版', '电影'};
 bool isMovieEpisodeName(String value) =>
     _movieMarkers.contains(_normalize(value));
 
+/// 从集名提取集号（`第3集` / `03` / `EP3` 等）；无法判定返回 null。
+/// 公开给跨源续播用：不同站点的同一集靠集号对齐。
+int? historyEpisodeNumberOf(String value) =>
+    _extractEpisodeNumber(_normalize(value));
+
 /// 规范化标题：去首尾空白、折叠空白、全角 ASCII 转半角、ASCII 小写。
 ///
 /// 不做标点删除 / 繁简转换 / 模糊匹配。

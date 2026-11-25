@@ -1,7 +1,8 @@
 import 'dart:convert';
-import 'dart:developer' as developer;
 import 'package:dio/dio.dart';
 import '../companion/companion_spider_api.dart' show SpiderPlayResult, playResultHint;
+import '../diagnostics/app_logger.dart';
+import 'package:flutter/foundation.dart';
 import '../config/models/vod_config.dart';
 import '../net/ascii_url.dart';
 import '../net/http_client_factory.dart';
@@ -28,12 +29,8 @@ class CmsJsonApi {
               ),
             );
 
-  /// 打印格式化调试日志到终端与控制台
-  void _log(String tag, String message) {
-    developer.log(message, name: 'xiugou-tv::$tag');
-    // ignore: avoid_print
-    print('[$tag] $message');
-  }
+  /// 统一走分级日志（debug 级只进内存 / app.log，不刷控制台）。
+  void _log(String tag, String message) => AppLogger.instance.debug(tag, message);
 
   /// 辅助构建请求头
   Map<String, dynamic> _buildHeaders(Site? site) {
@@ -63,13 +60,13 @@ class CmsJsonApi {
 
   /// 解析站源的有效 HTTP 访问地址 (兼容 api 为 http/https、ext 为 http/https、或 csp_ 站源扩展地址)
   String? _resolveHttpEndpoint(String apiEndpoint, Site? site) {
-    final rawApi = apiEndpoint.trim();
+    final rawApi = _stripUrlAuxiliarySuffix(apiEndpoint.trim());
     if (rawApi.startsWith('http://') || rawApi.startsWith('https://')) {
       return rawApi;
     }
     if (site?.type == 4) return null;
     // 如果 api 是 csp_ 等非 HTTP 协议，但 ext 是以 http 开头的有效地址 (如 csp_AppYsV2, csp_XBPQ, 直连)
-    final rawExt = site?.ext?.trim() ?? '';
+    final rawExt = _stripUrlAuxiliarySuffix(site?.ext?.trim() ?? '');
     if (rawExt.startsWith('http://') || rawExt.startsWith('https://')) {
       return rawExt;
     }
@@ -80,12 +77,22 @@ class CmsJsonApi {
         if (extMap is Map) {
           final candidate = extMap['url'] ?? extMap['api'] ?? extMap['site'];
           if (candidate is String && (candidate.startsWith('http://') || candidate.startsWith('https://'))) {
-            return candidate;
+            return _stripUrlAuxiliarySuffix(candidate);
           }
         }
       } catch (_) {}
     }
     return null;
+  }
+
+  /// 剥离 TVBox 生态里地址后面的 `|` 辅助段（如 `http://host:port|token`、`xxx.m3u8|Referer=...`）。
+  ///
+  /// 有些源配置把认证串/UA 等附加信息用 `|` 拼在 api 地址后面，整串交给 Dio 时
+  /// `|` 会落在端口段里触发 `FormatException: Invalid port`，导致站点完全无法加载；
+  /// 按 `|` 截断取前面的真实地址，是这类配置的通用容错做法。
+  String _stripUrlAuxiliarySuffix(String url) {
+    final pipe = url.indexOf('|');
+    return pipe >= 0 ? url.substring(0, pipe).trim() : url;
   }
 
   /// 站源是否存在可解析的 HTTP 端点（供搜索范围判定复用，不改变请求行为）
@@ -105,8 +112,7 @@ class CmsJsonApi {
         ? '?${queryParams.entries.map((e) => "${e.key}=${e.key == 'extend' ? '***' : Uri.encodeComponent(e.value.toString())}").join("&")}'
         : '';
     final fullUrl = '$url$qStr';
-    // 这两行会同时进 developer.log 与 stdout：地址 / 请求头里的凭据只留键名，
-    // 真实请求仍用原值。
+    // 地址 / 请求头里的凭据只留键名（日志还会统一过一遍脱敏），真实请求仍用原值。
     _log(tag, '--> 发起 GET 请求: ${maskSensitiveUrl(fullUrl)}');
     if (headers != null && headers.isNotEmpty) {
       final loggable = headers.map((k, v) => MapEntry(k, '$v'));
@@ -413,7 +419,8 @@ class CmsJsonApi {
         return detail;
       }
 
-      final map = _ensureJsonMap(trimmed);
+      // 详情响应体量大，解析丢给 isolate，别占着主线程
+      final map = await compute(decodeJsonMap, trimmed);
       final list = (map['list'] as List<dynamic>?) ?? (map['data'] as List<dynamic>?) ?? [];
       if (list.isEmpty) {
         if (siteType == 4) throw StateError('未找到影片详情 (ID: $vodId)');
@@ -432,7 +439,7 @@ class CmsJsonApi {
           headers: _buildHeaders(site),
           logTag: 'SiteApi::fetchDetail',
         );
-        final fbMap = _ensureJsonMap(fbRaw.trim());
+        final fbMap = await compute(decodeJsonMap, fbRaw.trim());
         final fbList = (fbMap['list'] as List<dynamic>?) ?? (fbMap['data'] as List<dynamic>?) ?? [];
         if (fbList.isNotEmpty) {
           final detailJson = fbList.first as Map<String, dynamic>;
@@ -854,4 +861,18 @@ class CmsJsonApi {
     }
     return <String, dynamic>{};
   }
+}
+
+/// 在 isolate 里解析 CMS 返回的 JSON（顶层函数，供 compute 调用）。
+///
+/// 详情接口的响应动辄几十 KB、聚合分类接口可达数百 KB。在主线程 jsonDecode
+/// 会直接吃掉几十毫秒，正好压在首屏与翻页续页这些最需要跟手的时刻。
+/// （项目里弹幕轨道早就这么做了，这里沿用同一套写法。）
+Map<String, dynamic> decodeJsonMap(String source) {
+  try {
+    final decoded = jsonDecode(source);
+    if (decoded is Map) return Map<String, dynamic>.from(decoded);
+    if (decoded is List) return <String, dynamic>{'list': decoded};
+  } catch (_) {}
+  return <String, dynamic>{};
 }

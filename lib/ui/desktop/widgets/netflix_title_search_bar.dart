@@ -157,14 +157,17 @@ class _NetflixTitleSearchBarState extends State<NetflixTitleSearchBar> {
                     onTap: widget.onClear,
                     semanticLabel: '清空搜索',
                     borderRadius: BorderRadius.circular(AppRadii.pill),
-                    child: GestureDetector(
-                      onTap: widget.onClear,
-                      child: Padding(
-                        padding: const EdgeInsets.symmetric(horizontal: 6),
-                        child: Icon(
-                          Icons.close_rounded,
-                          size: 14,
-                          color: palette.textSub,
+                    child: MouseRegion(
+                      cursor: SystemMouseCursors.click,
+                      child: GestureDetector(
+                        onTap: widget.onClear,
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 6),
+                          child: Icon(
+                            Icons.close_rounded,
+                            size: 14,
+                            color: palette.textSub,
+                          ),
                         ),
                       ),
                     ),

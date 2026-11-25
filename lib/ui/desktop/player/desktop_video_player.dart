@@ -2,9 +2,13 @@ import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:media_kit_video/media_kit_video.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:url_launcher/url_launcher.dart';
 import '../../../core/config/models/vod_config.dart';
 import '../../../core/danmaku/danmaku_controller.dart';
+import '../../../core/dlna/dlna_cast_controller.dart';
 import '../../../core/danmaku/danmaku_settings.dart';
 import '../../../core/danmaku/live_danmaku_models.dart';
 import '../../../core/player/decode_diagnostics.dart';
@@ -15,10 +19,13 @@ import '../../../core/player/models/track_info.dart';
 import '../../../core/player/mpv_player_engine.dart';
 import '../../../core/player/playback_intent.dart';
 import '../../../core/player/seek_recovery_controller.dart';
+import '../../../core/player/recording_target.dart';
+import '../../../core/cache/video_cache_store.dart';
 import '../../../core/segments/segment_models.dart';
 import '../../theme/app_palette.dart';
 import '../../theme/app_tokens.dart';
 import '../keyboard/player_shortcuts.dart';
+import 'cast_devices_dialog.dart';
 import 'danmaku_layer.dart';
 import 'danmaku_search_dialog.dart';
 import 'danmaku_settings_panel.dart';
@@ -26,6 +33,7 @@ import 'episode_drawer.dart';
 import 'playback_preparing_overlay.dart';
 import '../widgets/focus_ring.dart';
 import '../dialogs/app_dialog.dart';
+import '../dialogs/escape_closable.dart';
 import '../widgets/live_indicator.dart';
 import '../widgets/media_title_bar.dart';
 import '../window/desktop_window_manager.dart';
@@ -54,9 +62,9 @@ export 'playback_source_nav.dart';
 const Color _chromeScrim = Color(0xCC000000); // 顶 / 底遮罩主色
 const Color _chromeScrimFade = Color(0x00000000); // 遮罩渐隐端
 const Color _chromeInk = Color(0xFFFFFFFF); // 控制层前景（文字 / 图标 / 滑条）
+const Color _chromeCached = Color(0xFF59647C); // 本地缓存已下载（比未缓存亮、比已播暗）
 const Color _chromeHighlight = Color(0xFF94A3B8); // 高亮（已设态 / 已播进度）
 const Color _chromeTrack = Color(0xFF2E2E3C); // 滑条未播 / 未满轨道
-const Color _chromeBadge = Color(0xFF414A5B); // 徽章底（HW 标识）
 ///
 /// 控制条按钮统一点击盒尺寸（36×36）。
 ///
@@ -70,6 +78,16 @@ BoxFit videoFitForScale(String scale) => switch (scale) {
       'crop' => BoxFit.cover,
       _ => BoxFit.contain,
     };
+
+/// DLNA 投屏视图模型：宿主提供长生命周期控制器，播放器负责入口与本地让位。
+///
+/// 控制器订阅在播放器内部完成：连接建立时本地暂停，断开时恢复本地播放，
+/// 因此换集自动重推 / 弹窗外断开都能同步反映到底栏图标与本地状态。
+class PlayerCastNav {
+  const PlayerCastNav({required this.controller});
+
+  final DlnaCastController controller;
+}
 
 /// §43 弹幕视图模型（由宿主装配：加载 / 缓存 / 取消都在宿主的 [DanmakuController]）。
 class PlayerDanmakuNav {
@@ -400,6 +418,9 @@ class DesktopVideoPlayer extends StatefulWidget {
   /// 外部播放器入口；宿主取得播放地址并具备启动资格时提供。
   final PlayerExternalNav? externalNav;
 
+  /// DLNA 投屏入口；宿主提供长生命周期控制器时显示。
+  final PlayerCastNav? castNav;
+
   /// 兼容宿主传入的 seek 能力；恢复状态不参与提示或控制栏显隐。
   final SeekRecoveryCapable? seekRecovery;
 
@@ -513,6 +534,7 @@ class DesktopVideoPlayer extends StatefulWidget {
     this.qualityNav,
     this.sourceSwitchNav,
     this.externalNav,
+    this.castNav,
     this.seekRecovery,
     this.playbackModeNav,
     this.liveSourceNav,
@@ -543,19 +565,21 @@ class _DesktopVideoPlayerState extends State<DesktopVideoPlayer> {
 
   bool _showControls = true;
   Timer? _hideControlsTimer;
-  static const Duration _hideDelay = Duration(seconds: 3);
+  /// 键盘 / 起播后的兜底隐藏时延（用户反馈 3 秒太快，放宽到 5 秒）。
+  static const Duration _hideDelay = Duration(seconds: 5);
 
   /// §37：指针是否停在顶 / 底控制条热区内。
   ///
   /// 显隐判定从「鼠标在动」改成「指针在热区」—— 画面中部移动不再唤起控制条，
-  /// 离开热区 [_chromeExitDelay] 后收起（比 3 秒的键盘兜底快，才符合「移走就隐藏」）。
+  /// 离开热区 [_chromeExitDelay] 后收起。原先 150ms 太敏感，鼠标稍微移开会瞬间
+  /// 隐藏，放宽到 2 秒，仍比键盘兜底 [_hideDelay] 快。
   bool _pointerInChrome = false;
 
   /// §44 指针停在右下角片段 / 跳过片头胶囊上（视作控制区：不隐藏控制条）
   bool _pointerOnPill = false;
   static const double _topChromeZone = 62;
   static const double _bottomChromeZone = 110;
-  static const Duration _chromeExitDelay = Duration(milliseconds: 150);
+  static const Duration _chromeExitDelay = Duration(seconds: 2);
 
   /// §55 光标显隐独立于控制条：鼠标在播放器任意位置移动即显示，静止
   /// [PlayerSettings.cursorIdleDelay] 后（且正在播放）隐藏。
@@ -567,6 +591,9 @@ class _DesktopVideoPlayerState extends State<DesktopVideoPlayer> {
 
   /// 沉浸播放（§38）：窗口自绘标题栏此时不渲染，窗口三键并进本顶栏。
   bool _immersive = false;
+
+  /// 投屏期间本地是否已让位暂停（用于断开后恢复，避免重复暂停/恢复）。
+  bool _castLocallyPaused = false;
 
   /// §20 选集抽屉（右侧）：打开期间不自动隐藏控制条，Esc / 点遮罩关闭。
   bool _episodeDrawerOpen = false;
@@ -633,7 +660,13 @@ class _DesktopVideoPlayerState extends State<DesktopVideoPlayer> {
   /// 静音起播检测用的引擎状态订阅（dispose 时取消）。
   StreamSubscription<PlaybackStatus>? _statusSubscription;
 
-  /// 主快进键临时倍速；进入长按前的倍速，松开 / 失焦时还原。
+  /// 录制意外结束（源断开）的播报订阅（dispose 时取消）。
+  StreamSubscription<String>? _recordingEndedSubscription;
+
+  /// 录制自然结束（点播下完）的播报订阅（dispose 时取消）。
+  StreamSubscription<String>? _recordingFinishedSubscription;
+
+  /// §14 长按 → 临时倍速；进入长按前的倍速，松开 / 失焦时还原。
   late final HoldToSpeedGesture _holdGesture = HoldToSpeedGesture(
     getBinding: () => widget.shortcuts.primarySeekForward,
     isEnabled: () => !_isLiveMode && !_usingEmbedded && !_drawerOrPanelOpen && !_hasEditableFocus,
@@ -694,6 +727,7 @@ class _DesktopVideoPlayerState extends State<DesktopVideoPlayer> {
     widget.windowManager.isImmersiveNotifier.addListener(_onImmersiveChanged);
     _immersive = widget.windowManager.isImmersiveNotifier.value;
     _syncImmersive(widget.hideWindowTitleBar);
+    widget.castNav?.controller.state.addListener(_onCastStateChanged);
     _bottomBarFocusNode.addListener(_onBottomBarFocusChanged);
     // 引擎是全应用单例（广播流）：订阅必须在 dispose 时取消，否则每进一次播放页
     // 就多挂一个监听，闭包还会拽住整个 State 无法回收（2026-10-28 发布前资源审查）。
@@ -718,6 +752,18 @@ class _DesktopVideoPlayerState extends State<DesktopVideoPlayer> {
           _startHideTimer();
         }
       }
+    });
+    // 录制被源断开终止时，按钮已自动回到「开始录制」，这里补一条 OSD 说明原因。
+    _recordingEndedSubscription =
+        widget.playerEngine.recordingEndedStream.listen((reason) {
+      if (!mounted) return;
+      _osdController.show(Icons.error_outline_rounded, reason);
+    });
+    // 点播录完是正常结束：用成功图标，不要让用户以为出错了。
+    _recordingFinishedSubscription =
+        widget.playerEngine.recordingFinishedStream.listen((message) {
+      if (!mounted) return;
+      _osdController.show(Icons.check_circle_outline_rounded, message);
     });
     _startHideTimer();
     _armCursorIdle();
@@ -774,6 +820,10 @@ class _DesktopVideoPlayerState extends State<DesktopVideoPlayer> {
   @override
   void didUpdateWidget(covariant DesktopVideoPlayer oldWidget) {
     super.didUpdateWidget(oldWidget);
+    if (oldWidget.castNav?.controller != widget.castNav?.controller) {
+      oldWidget.castNav?.controller.state.removeListener(_onCastStateChanged);
+      widget.castNav?.controller.state.addListener(_onCastStateChanged);
+    }
     if (oldWidget.shortcuts != widget.shortcuts) _holdGesture.cancel();
     if (widget.episodeNav?.switching == true &&
         oldWidget.episodeNav?.switching != true) {
@@ -832,10 +882,13 @@ class _DesktopVideoPlayerState extends State<DesktopVideoPlayer> {
     _focusNode.removeListener(_onPlayerFocusChanged);
     FocusManager.instance.removeListener(_onPlayerFocusChanged);
     unawaited(_statusSubscription?.cancel());
+    unawaited(_recordingEndedSubscription?.cancel());
+    unawaited(_recordingFinishedSubscription?.cancel());
     _hideControlsTimer?.cancel();
     _cursorIdleTimer?.cancel();
     _channelWheelBurst?.cancel();
     _syncImmersive(false);
+    widget.castNav?.controller.state.removeListener(_onCastStateChanged);
     widget.windowManager.isPipNotifier.removeListener(_onPipChanged);
     widget.windowManager.isImmersiveNotifier
         .removeListener(_onImmersiveChanged);
@@ -1029,6 +1082,29 @@ class _DesktopVideoPlayerState extends State<DesktopVideoPlayer> {
       _osdController.show(Icons.play_arrow_rounded, '播放中');
     }
     _onUserActivity();
+  }
+
+  /// 投屏会话变化：连接时让本地播放停掉（电视接管），断开时恢复本地。
+  ///
+  /// 用「是否让位」而不是「当前是否播放」判断，避免用户手动暂停后投屏断开
+  /// 又被自动恢复。控制器是应用级单例，换集重推 / 弹窗外断开都会走到这里。
+  void _onCastStateChanged() {
+    final nav = widget.castNav;
+    if (nav == null || !mounted) return;
+    final castState = nav.controller.state.value;
+    if (castState.connected && !_castLocallyPaused) {
+      _castLocallyPaused = true;
+      unawaited(widget.playerEngine.pauseForExternalPlayback());
+      _osdController.show(
+        Icons.cast_rounded,
+        '正在投屏',
+        subText: castState.device?.friendlyName,
+      );
+    } else if (!castState.connected && _castLocallyPaused) {
+      _castLocallyPaused = false;
+      unawaited(widget.playerEngine.resume());
+      _osdController.show(Icons.tv_off_rounded, '已断开投屏，继续本地播放');
+    }
   }
 
   void _handleSeek(Duration delta) {
@@ -1301,6 +1377,15 @@ class _DesktopVideoPlayerState extends State<DesktopVideoPlayer> {
     manager.toggleFullScreen();
   }
 
+  /// 顶 / 底控制栏显示时会盖住画面层，画面上的双击收不到。
+  /// 控制栏空白区复用同一个双击处理；deferToChild 让按钮 / 滑块优先，
+  /// 连点控件不会误切全屏。
+  Widget _withChromeDoubleTap(Widget child) => GestureDetector(
+        behavior: HitTestBehavior.deferToChild,
+        onDoubleTap: _handleSurfaceDoubleTap,
+        child: child,
+      );
+
   /// PiP 状态变化 → 重建（顶栏隐藏 / 底栏切换精简版）。
   void _onPipChanged() {
     if (mounted) setState(() {});
@@ -1392,6 +1477,175 @@ class _DesktopVideoPlayerState extends State<DesktopVideoPlayer> {
     final minutes = d.inMinutes.remainder(60).toString().padLeft(2, '0');
     final seconds = d.inSeconds.remainder(60).toString().padLeft(2, '0');
     return hours > 0 ? '$hours:$minutes:$seconds' : '$minutes:$seconds';
+  }
+
+  /// 底栏设置左侧的「视频信息」：快照当前播放会话的基本信息，地址可直接复制或在浏览器打开。
+  void _showVideoInfoDialog() {
+    final spec = widget.playerEngine.currentSpec;
+    final dimensions = widget.playerEngine.dimensions;
+    final duration = widget.playerEngine.duration;
+    final position = widget.playerEngine.position;
+    final url = spec?.url.trim() ?? '';
+
+    final quality = (spec != null &&
+            spec.qualityIndex >= 0 &&
+            spec.qualityIndex < spec.qualities.length)
+        ? spec.qualities[spec.qualityIndex].name
+        : '';
+
+    showAppDialog<void>(
+      context: context,
+      builder: (dialogContext) {
+        // 与设置页弹窗同一套配色 / 字体：raised 底、textTitle 标题、textMain 正文。
+        final palette = dialogContext.palette;
+        final linkColor = palette.accentInk;
+        return EscapeClosable(
+          child: AlertDialog(
+          backgroundColor: palette.raised,
+          title: Row(
+            children: [
+              Icon(Icons.info_outline_rounded, color: linkColor),
+              const SizedBox(width: AppSpacing.sm),
+              Text(
+                '视频信息',
+                style: TextStyle(
+                  fontSize: AppType.heading,
+                  color: palette.textTitle,
+                ),
+              ),
+            ],
+          ),
+          content: SizedBox(
+            width: 460,
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  _VideoInfoRow(
+                    label: '标题',
+                    value: (spec?.title ?? '').trim().isEmpty
+                        ? '—'
+                        : spec!.title!.trim(),
+                  ),
+                  _VideoInfoRow(
+                    label: '总时长',
+                    value: duration > Duration.zero
+                        ? _formatDuration(duration)
+                        : (spec?.isLive == true ? '直播（无总时长）' : '未知'),
+                  ),
+                  _VideoInfoRow(
+                    label: '当前进度',
+                    value: _formatDuration(position),
+                  ),
+                  _VideoInfoRow(
+                    label: '分辨率',
+                    value: (dimensions.width > 0 && dimensions.height > 0)
+                        ? '${dimensions.width} × ${dimensions.height}'
+                        : '未知',
+                  ),
+                  _VideoInfoRow(
+                    label: '播放方式',
+                    value: spec?.isLive == true ? '直播' : '点播',
+                  ),
+                  if (quality.isNotEmpty)
+                    _VideoInfoRow(label: '清晰度', value: quality),
+                  if ((spec?.headers?.isNotEmpty ?? false))
+                    _VideoInfoRow(
+                      label: '请求头',
+                      value: '${spec!.headers!.length} 项（浏览器打开不会携带）',
+                    ),
+                  const SizedBox(height: 10),
+                  Text(
+                    '视频地址',
+                    style: TextStyle(
+                      color: palette.textSub,
+                      fontSize: AppType.label,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(AppSpacing.sm),
+                    decoration: BoxDecoration(
+                      color: palette.panel,
+                      borderRadius: BorderRadius.circular(AppRadii.sm),
+                    ),
+                    child: url.isEmpty
+                        ? Text('暂无视频地址', style: TextStyle(color: palette.textSub))
+                        : GestureDetector(
+                            onTap: () => _openVideoUrl(url),
+                            child: Text(
+                              url,
+                              style: TextStyle(
+                                color: linkColor,
+                                fontSize: AppType.label,
+                                decoration: TextDecoration.underline,
+                              ),
+                              maxLines: 4,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    '点击地址用系统浏览器打开；部分站点需要鉴权请求头，浏览器可能无法直接播放。',
+                    style: TextStyle(
+                      color: palette.textSub,
+                      fontSize: AppType.caption,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: url.isEmpty ? null : () => _copyVideoUrl(url),
+              child: const Text('复制地址'),
+            ),
+            TextButton(
+              onPressed: url.isEmpty
+                  ? null
+                  : () {
+                      Navigator.of(dialogContext).pop();
+                      _openVideoUrl(url);
+                    },
+              child: const Text('浏览器打开'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(),
+              child: const Text('关闭'),
+            ),
+          ],
+          ),
+        );
+      },
+    );
+  }
+
+  Future<void> _copyVideoUrl(String url) async {
+    await Clipboard.setData(ClipboardData(text: url));
+    if (mounted) _osdController.show(Icons.content_copy_rounded, '视频地址已复制');
+  }
+
+  Future<void> _openVideoUrl(String url) async {
+    final uri = Uri.tryParse(url);
+    if (uri == null ||
+        !uri.hasScheme ||
+        (uri.scheme != 'http' && uri.scheme != 'https')) {
+      _osdController.show(Icons.error_outline_rounded, '该地址不是可直接打开的网页链接');
+      return;
+    }
+    try {
+      final opened = await launchUrl(uri, mode: LaunchMode.externalApplication);
+      if (!opened && mounted) {
+        _osdController.show(Icons.error_outline_rounded, '未能打开系统浏览器');
+      }
+    } catch (_) {
+      if (mounted) _osdController.show(Icons.error_outline_rounded, '打开浏览器失败');
+    }
   }
 
   Widget _buildResolutionBadge() {
@@ -1580,30 +1834,14 @@ class _DesktopVideoPlayerState extends State<DesktopVideoPlayer> {
                       backTooltip: '${canCancelPrepare ? '取消并返回' : '返回'} (${_shortcutLabel(PlayerShortcutAction.exitFullscreen)})',
                       onBack: canCancelPrepare
                           ? widget.onCancelPrepare : widget.onBack,
+                      // 顶栏标题区是可见时可拖动的空白区，双击与画面同语义。
+                      onTitleDoubleTap: _handleSurfaceDoubleTap,
                       leadingAccessory: widget.playbackModeNav == null
                           ? null
                           : PlaybackModeBadge(
                               nav: widget.playbackModeNav!,
                               onMenuOpenChanged: _handleSourceMenuOpen,
                             ),
-                      actions: [
-                        Container(
-                          padding: const EdgeInsets.symmetric(
-                              horizontal: 6, vertical: 2),
-                          decoration: BoxDecoration(
-                            color: _chromeBadge.withValues(alpha: 0.8),
-                            borderRadius: BorderRadius.circular(AppRadii.xs),
-                          ),
-                          child: const Text(
-                            'HW: D3D11',
-                            style: TextStyle(
-                              color: _chromeInk,
-                              fontSize: AppType.caption,
-                              fontWeight: FontWeight.bold,
-                            ),
-                          ),
-                        ),
-                      ],
                     ),
                   ),
                 ),
@@ -1630,9 +1868,9 @@ class _DesktopVideoPlayerState extends State<DesktopVideoPlayer> {
                       focusNode: _bottomBarFocusNode,
                       // 纯焦点信号监听，不进语义树（避免改变逐帧语义增量）。
                       includeSemantics: false,
-                      child: pip
-                          ? _buildPipCompactBar()
-                          : Container(
+                        child: pip
+                          ? _withChromeDoubleTap(_buildPipCompactBar())
+                          : _withChromeDoubleTap(Container(
                               key: const ValueKey('player-bottom-bar'),
                               padding: const EdgeInsets.symmetric(
                                   horizontal: 16, vertical: 8),
@@ -1658,15 +1896,31 @@ class _DesktopVideoPlayerState extends State<DesktopVideoPlayer> {
                                             onSecondaryTapUp: (details) =>
                                                 _showTimelineMenu(details,
                                                     constraints.maxWidth),
-                                            child: Overlay.wrap(
-                                              alwaysSizeToContent: true,
-                                              clipBehavior: Clip.none,
-                                              child: _buildProgressBar(),
+                                            // 不能 alwaysSizeToContent：那会让 Overlay
+                                            // 按内容宽度收缩，进度条只占左侧一截，
+                                            // Expanded 剩下的空间变成右侧大片空白。
+                                            // 显式给满宽，保证滑条铺到时间标签前。
+                                            child: SizedBox(
+                                              width: constraints.maxWidth,
+                                              // Slider 的提示气泡住在 OverlayPortal 里，
+                                              // portal 会把 traversalParentIdentifier 挂到
+                                              // 最近的语义节点上。给进度条单独一个容器，
+                                              // 免得它和音量条共用祖先节点、互相覆盖成孤儿。
+                                              child: Semantics(
+                                                container: true,
+                                                child: Overlay.wrap(
+                                                  clipBehavior: Clip.none,
+                                                  child: _buildProgressBar(),
+                                                ),
+                                              ),
                                             ),
                                           ),
                                         ),
                                       ),
-                                      const SizedBox(width: 12),
+                                      // 与底栏左右 padding（16）对齐：滑条两侧各有
+                                      // 10 的对称 padding，所以这里也留 16，使轨道
+                                      // 左右到相邻内容的空白一致。
+                                      const SizedBox(width: 16),
                                       _buildTimeLabel(),
                                     ],
                                   ),
@@ -1713,6 +1967,8 @@ class _DesktopVideoPlayerState extends State<DesktopVideoPlayer> {
                                               onPressed: _handleReplay,
                                             ),
                                           if (!_isLiveMode && session == null) _buildSpeedSelector(),
+                                          // 录制当前播放（原样 dump 源字节，不重编码；本地独有）
+                                          _buildRecordButton(),
                                           if (_hasQualityChoices)
                                             _buildQualitySelector(),
                                         ]),
@@ -1727,6 +1983,10 @@ class _DesktopVideoPlayerState extends State<DesktopVideoPlayer> {
                                           if (_hasDanmakuSettings)
                                             _buildDanmakuSettingsButton(),
                                           _buildVolumeControl(),
+                                          // 投屏与视频信息同属「把当前地址送出去」语义
+                                          _buildCastButton(),
+                                          // 视频信息紧挨「播放设置」左侧（用户指定位置）
+                                          _buildVideoInfoButton(),
                                           if (_hasSettingsEntries)
                                             _buildSettingsButton(),
                                           if (_canShowExternalPlayer)
@@ -1739,7 +1999,7 @@ class _DesktopVideoPlayerState extends State<DesktopVideoPlayer> {
                                   ),
                                 ],
                               ),
-                            ),
+                            )),
                     ),
                   ),
                 ),
@@ -1876,35 +2136,66 @@ class _DesktopVideoPlayerState extends State<DesktopVideoPlayer> {
         final durMs = widget.playerEngine.duration.inMilliseconds.toDouble();
         final maxVal = durMs > 0 ? durMs : 1.0;
 
-        return MouseRegion(
-          onEnter: (_) => setState(() => _progressHovered = true),
-          onExit: (_) => setState(() => _progressHovered = false),
-          child: TweenAnimationBuilder<double>(
-            // 悬停加粗（B5）：轨道 3.5→6、滑点 6→7，200ms 过渡。
-            tween: Tween<double>(end: _progressHovered ? 1.0 : 0.0),
-            duration: _chromeMotion(context, visible: true),
-            curve: AppMotion.ease,
-            builder: (context, t, _) => SliderTheme(
-              data: SliderTheme.of(context).copyWith(
-                trackHeight: 3.5 + 2.5 * t,
-                // §44 片段色块（片头片尾绿、广告黄……）画在轨道上、滑点之下
-                trackShape: SegmentTrackShape(marks),
-                thumbShape: RoundSliderThumbShape(enabledThumbRadius: 6 + t),
-                activeTrackColor: _chromeHighlight,
-                inactiveTrackColor: _chromeTrack,
-                thumbColor: _chromeInk,
-                overlayColor: _chromeHighlight.withValues(alpha: 0.2),
+        return StreamBuilder<VideoCacheProgress>(
+          stream: widget.playerEngine.cacheProgressStream,
+          initialData: widget.playerEngine.cacheProgress,
+          builder: (context, cacheSnap) {
+            final cache = cacheSnap.data;
+            // 缓存前沿（毫秒）：交给 Slider 原生的 secondaryTrackValue 画
+            // 「滑点 → 前沿」那一段 —— 原生 setter 带 markNeedsPaint()，
+            // 暂停时缓存推进也能实时重画。
+            final frontierMs = (cache != null && cache.frontierMs > 0)
+                ? cache.frontierMs.clamp(0, maxVal.toInt()).toDouble()
+                : null;
+            return MouseRegion(
+              onEnter: (_) => setState(() => _progressHovered = true),
+              onExit: (_) => setState(() => _progressHovered = false),
+              child: TweenAnimationBuilder<double>(
+                // 悬停加粗（B5）：轨道 3.5→6、滑点 6→7，200ms 过渡。
+                tween: Tween<double>(end: _progressHovered ? 1.0 : 0.0),
+                duration: _chromeMotion(context, visible: true),
+                curve: AppMotion.ease,
+                builder: (context, t, _) => SliderTheme(
+                  data: SliderTheme.of(context).copyWith(
+                    trackHeight: 3.5 + 2.5 * t,
+                    // Flutter 3.44 的 Slider 默认左右内边距不对称（左边 thumb/2、
+                    // 右边 thumb/overlay 全宽），显式给对称 padding 后轨道铺满
+                    // 内盒，两端留给 thumb 的空白一致。
+                    padding: const EdgeInsets.symmetric(horizontal: 10),
+                    // §44 片段色块（片头片尾绿、广告黄……）画在轨道上、滑点之下
+                    trackShape: SegmentTrackShape(marks),
+                    thumbShape: RoundSliderThumbShape(enabledThumbRadius: 6 + t),
+                    activeTrackColor: _chromeHighlight,
+                    inactiveTrackColor: _chromeTrack,
+                    // 本地缓存带：滑点 → 缓存前沿（原生 secondary track）
+                    secondaryActiveTrackColor: _chromeCached,
+                    thumbColor: _chromeInk,
+                    overlayColor: _chromeHighlight.withValues(alpha: 0.2),
+                  ),
+                  child: Slider(
+                    key: const ValueKey('player-timeline'),
+                    value: posMs.clamp(0.0, maxVal),
+                    max: maxVal,
+                    secondaryTrackValue: frontierMs,
+                    onChangeStart: durMs > 0 ? _previewSeek : null,
+                    onChanged: (val) {
+                      if (durMs > 0) _previewSeek(val);
+                      setState(() => _dragSeekPositionMs = val);
+                    },
+                    onChangeEnd: (val) {
+                      if (durMs > 0) {
+                        _commitSeek(val);
+                      } else {
+                        widget.playerEngine
+                            .seek(Duration(milliseconds: val.toInt()));
+                      }
+                      setState(() => _dragSeekPositionMs = -1.0);
+                    },
+                  ),
+                ),
               ),
-              child: Slider(
-                key: const ValueKey('player-timeline'),
-                value: posMs.clamp(0.0, maxVal),
-                max: maxVal,
-                onChangeStart: durMs > 0 ? _previewSeek : null,
-                onChanged: durMs > 0 ? _previewSeek : null,
-                onChangeEnd: durMs > 0 ? _commitSeek : null,
-              ),
-            ),
-          ),
+            );
+          },
         );
       },
     ));
@@ -1968,7 +2259,10 @@ class _DesktopVideoPlayerState extends State<DesktopVideoPlayer> {
     // 直播不显示常驻细进度线：直链场景里 duration > 0 时它会变成
     // 「直播却有一条看起来可拖动的时间轴」，与 D4 的口径冲突。
     if (_isLiveMode) return const SizedBox.shrink();
-    return _withSegmentMarks((marks) => StreamBuilder<Duration>(
+    return _withSegmentMarks((marks) => StreamBuilder<VideoCacheProgress>(
+          stream: widget.playerEngine.cacheProgressStream,
+          initialData: widget.playerEngine.cacheProgress,
+          builder: (context, cacheSnap) => StreamBuilder<Duration>(
       stream: widget.playerEngine.positionStream,
       initialData: widget.playerEngine.position,
       builder: (context, snapshot) {
@@ -1977,6 +2271,13 @@ class _DesktopVideoPlayerState extends State<DesktopVideoPlayer> {
         final posMs = (snapshot.data?.inMilliseconds ?? 0)
             .clamp(0, hasDuration ? durMs : 1);
         final fraction = hasDuration ? posMs / durMs : 0.0;
+        final cache = cacheSnap.data;
+        final aheadEnd = (hasDuration && cache != null && cache.frontierMs > 0)
+            ? (cache.frontierMs / durMs).clamp(0.0, 1.0)
+            : 0.0;
+        final prefixFrac = (hasDuration && cache != null && cache.prefixMs > 0)
+            ? (cache.prefixMs / durMs).clamp(0.0, 1.0)
+            : 0.0;
         final visible =
             widget.showMiniProgress && !_chromeVisible && hasDuration;
         return IgnorePointer(
@@ -1992,6 +2293,22 @@ class _DesktopVideoPlayerState extends State<DesktopVideoPlayer> {
                 fit: StackFit.expand,
                 children: [
                   ColoredBox(color: _chromeTrack.withValues(alpha: alpha)),
+                  // 本地缓存带（回填前缀）：0 → prefix
+                  if (prefixFrac > 0)
+                    FractionallySizedBox(
+                      alignment: Alignment.centerLeft,
+                      widthFactor: prefixFrac,
+                      child: ColoredBox(
+                          color: _chromeCached.withValues(alpha: alpha)),
+                    ),
+                  // 本地缓存带（顺播前沿）：播放位置 → frontier
+                  if (aheadEnd > fraction)
+                    FractionallySizedBox(
+                      alignment: Alignment.centerLeft,
+                      widthFactor: aheadEnd,
+                      child: ColoredBox(
+                          color: _chromeCached.withValues(alpha: alpha)),
+                    ),
                   FractionallySizedBox(
                     alignment: Alignment.centerLeft,
                     widthFactor: fraction,
@@ -2015,6 +2332,7 @@ class _DesktopVideoPlayerState extends State<DesktopVideoPlayer> {
           ),
         );
       },
+        ),
     ));
   }
 
@@ -2128,8 +2446,11 @@ class _DesktopVideoPlayerState extends State<DesktopVideoPlayer> {
             ? Duration(milliseconds: _dragSeekPositionMs.toInt())
             : snapshot.data ?? Duration.zero;
         final dur = widget.playerEngine.duration;
-        return SizedBox(
-          width: 108,
+        // 原先固定 108 宽：'29:04 / 45:40' 只占约 70，剩下 38 变成进度条右侧
+        // 那一大块空白。改成按内容宽度（只留极小下限抑制秒数跳动的宽度变化），
+        // 进度条就能一直铺到时间标签前。
+        return ConstrainedBox(
+          constraints: const BoxConstraints(minWidth: 72),
           child: Text(
             _isLiveMode
                 ? '直播 · 已播 ${_formatDuration(pos)}'
@@ -2528,10 +2849,13 @@ class _DesktopVideoPlayerState extends State<DesktopVideoPlayer> {
           Row(
             children: [
               Expanded(
-                child: Overlay.wrap(
-                  alwaysSizeToContent: true,
-                  clipBehavior: Clip.none,
-                  child: _buildProgressBar(),
+                child: Semantics(
+                  container: true,
+                  child: Overlay.wrap(
+                    alwaysSizeToContent: true,
+                    clipBehavior: Clip.none,
+                    child: _buildProgressBar(),
+                  ),
                 ),
               ),
               const SizedBox(width: 10),
@@ -2680,6 +3004,53 @@ class _DesktopVideoPlayerState extends State<DesktopVideoPlayer> {
       _hasQualityChoices ||
       (_canShowSourceActions && widget.sourceSwitchNav != null) ||
       (widget.playerInfoLabel?.trim().isNotEmpty ?? false);
+
+  Widget _buildVideoInfoButton() {
+    return _buildBottomControlTooltip(
+      message: '视频信息',
+      child: _ControlButton(
+        key: const ValueKey('player-video-info'),
+        icon: Icons.info_outline_rounded,
+        onPressed: _showVideoInfoDialog,
+      ),
+    );
+  }
+
+  /// DLNA 投屏入口：有地址才可用；已投屏时图标高亮并提示设备名。
+  Widget _buildCastButton() {
+    final nav = widget.castNav;
+    if (nav == null) return const SizedBox.shrink();
+    return ValueListenableBuilder(
+      valueListenable: nav.controller.state,
+      builder: (context, castState, _) {
+        final spec = widget.playerEngine.currentSpec;
+        final canCast = spec != null && spec.url.trim().isNotEmpty;
+        final connected = castState.connected;
+        return _buildBottomControlTooltip(
+          message: connected
+              ? '投屏中：${castState.device?.friendlyName ?? ''}'
+              : '投屏到电视',
+          child: _ControlButton(
+            key: const ValueKey('player-cast'),
+            icon: connected ? Icons.cast_connected_rounded : Icons.cast_rounded,
+            iconColor: connected ? _chromeHighlight : null,
+            onPressed: canCast ? _showCastDialog : null,
+          ),
+        );
+      },
+    );
+  }
+
+  Future<void> _showCastDialog() async {
+    final nav = widget.castNav;
+    final spec = widget.playerEngine.currentSpec;
+    if (nav == null || spec == null || spec.url.trim().isEmpty) return;
+    await CastDevicesDialog.show(
+      context,
+      spec: spec,
+      controller: nav.controller,
+    );
+  }
 
   Widget _buildSettingsButton() {
     return _buildBottomControlTooltip(
@@ -3239,17 +3610,22 @@ class _DesktopVideoPlayerState extends State<DesktopVideoPlayer> {
       initialData: widget.playerEngine.rate,
       builder: (context, snapshot) {
         final currentRate = snapshot.data ?? 1.0;
-        return FocusOutline(
-          child: Theme(
-            // 底栏文本控件 hover 统一为浅色 12%（默认主题 hover 在深底上不可辨）。
-            data: Theme.of(context).copyWith(
-              hoverColor: _chromeInk.withValues(alpha: 0.12),
-            ),
-            child: PopupMenuButton<double>(
-              key: const ValueKey('player-speed-menu'),
-              tooltip: '播放倍速 (${_shortcutLabel(PlayerShortcutAction.rateUp)}加速 / '
-                  '${_shortcutLabel(PlayerShortcutAction.rateDown)}减速 / '
-                  '${_shortcutLabel(PlayerShortcutAction.rateReset)}重置)',
+        final speedTooltip = '播放倍速 (${_shortcutLabel(PlayerShortcutAction.rateUp)}加速 / '
+            '${_shortcutLabel(PlayerShortcutAction.rateDown)}减速 / '
+            '${_shortcutLabel(PlayerShortcutAction.rateReset)}重置)';
+        // 与底栏其它选择器一致：提示统一走外层 Tooltip（向上展开），
+        // 不再用 PopupMenuButton 内置 tooltip（默认向下，会压住倍速按钮）。
+        return _buildBottomControlTooltip(
+          message: speedTooltip,
+          child: FocusOutline(
+            child: Theme(
+              // 底栏文本控件 hover 统一为浅色 12%（默认主题 hover 在深底上不可辨）。
+              data: Theme.of(context).copyWith(
+                hoverColor: _chromeInk.withValues(alpha: 0.12),
+              ),
+              child: PopupMenuButton<double>(
+                key: const ValueKey('player-speed-menu'),
+                tooltip: '',
               color: context.palette.raised,
               shape: RoundedRectangleBorder(
                   borderRadius: BorderRadius.circular(AppRadii.md)),
@@ -3299,7 +3675,8 @@ class _DesktopVideoPlayerState extends State<DesktopVideoPlayer> {
               },
             ),
           ),
-        );
+        ),
+      );
       },
     );
   }
@@ -3321,7 +3698,7 @@ class _DesktopVideoPlayerState extends State<DesktopVideoPlayer> {
         final hasSelected = tracks.any((t) => t.isSelected);
         final canDisable = nav.onDisable != null;
         return _buildBottomControlTooltip(
-          message: '字幕（开关 / 轨道）',
+          message: '字幕（开关 / 轨道 / 外挂）',
           child: FocusOutline(
             inset: const EdgeInsets.symmetric(horizontal: 8),
             child: PopupMenuButton<String>(
@@ -3734,6 +4111,99 @@ class _DesktopVideoPlayerState extends State<DesktopVideoPlayer> {
     }
   }
 
+  // --- 录制 ---
+
+  /// 录制中状态的前景红点色。控制层 chrome 恒深（见文件头说明），
+  /// 录制红点为通用语义色，与主题解耦，深浅色下都清晰可辨。
+  static const Color _recordingInk = Color(0xFFF87171);
+
+  /// 开始 / 停止录制当前播放（原样 dump，不重编码；换源自动终止）。
+  Future<void> _toggleRecording() async {
+    final engine = widget.playerEngine;
+    if (engine.isRecording) {
+      final path = await engine.stopRecording();
+      _osdController.show(
+        Icons.fiber_manual_record_rounded,
+        path == null ? '录制已停止' : '录制已保存：$path',
+      );
+      return;
+    }
+    final spec = engine.currentSpec;
+    if (spec == null || spec.url.isEmpty) {
+      _osdController.show(
+          Icons.error_outline_rounded, '当前没有正在播放的内容，无法录制');
+      return;
+    }
+    try {
+      final root = await _resolveRecordRoot();
+      final path = RecordingTarget.resolve(
+        root: root,
+        title: spec.title ?? '录制',
+        url: spec.url,
+      );
+      // start() 要等首片数据真实落盘（拉清单→选清晰度→取密钥→下载首片，
+      // 一般几秒），先立刻给反馈，避免"点了没反应"。
+      _osdController.show(
+          Icons.fiber_manual_record_rounded, '正在连接视频源，开始录制…');
+      // 快播完时引擎会忽略 from 改为从头录，这里如实告诉用户，
+      // 免得他以为录的是"剩下的几十秒"。
+      final nearEnd = _isNearEndForRecording(engine);
+      await engine.startRecording(path, from: nearEnd ? null : engine.position);
+      _osdController.show(
+          Icons.fiber_manual_record_rounded,
+          nearEnd ? '已接近片尾，改为从头录制：$path' : '开始录制：$path');
+    } catch (e) {
+      _osdController.show(
+          Icons.error_outline_rounded, '无法开始录制：${_friendlyError(e)}');
+    }
+  }
+
+  /// 剩余时长不足 60 秒（或已播完）：此时从当前位置起录只剩零星分片，
+  /// 与引擎 `_recordTailGuard` 的判定保持一致。
+  bool _isNearEndForRecording(MpvPlayerEngine engine) {
+    final total = engine.duration;
+    if (total <= Duration.zero) return false; // 直播 / 时长未知
+    return engine.position >= total - const Duration(seconds: 60);
+  }
+
+  /// 去掉 Dart 异常的技术前缀（"Bad state: " / "Exception: "），OSD 直出人话。
+  String _friendlyError(Object e) =>
+      e.toString().replaceFirst(RegExp(r'^(Bad state|Exception):\s*'), '');
+
+  /// 默认录制根目录：系统「下载」→「文档」（逐级回退）。
+  Future<String> _resolveRecordRoot() async {
+    final downloads = await getDownloadsDirectory();
+    if (downloads != null) return downloads.path;
+    final docs = await getApplicationDocumentsDirectory();
+    return docs.path;
+  }
+
+  Widget _buildRecordButton() {
+    return StreamBuilder<bool>(
+      stream: widget.playerEngine.recordingStream,
+      initialData: widget.playerEngine.isRecording,
+      builder: (context, snapshot) {
+        final recording = snapshot.data ?? false;
+        return _buildBottomControlTooltip(
+          message: recording ? '停止录制' : '录制当前播放（保存到下载目录）',
+          child: FocusOutline(
+            radius: AppRadii.pill,
+            child: IconButton(
+              icon: recording
+                  ? const Icon(Icons.stop_rounded,
+                      size: 20, color: _recordingInk)
+                  : const Icon(Icons.fiber_manual_record_rounded,
+                      size: 20, color: _chromeInk),
+              padding: EdgeInsets.zero,
+              constraints: const BoxConstraints.tightFor(width: 36, height: 36),
+              onPressed: _toggleRecording,
+            ),
+          ),
+        );
+      },
+    );
+  }
+
   Widget _buildVolumeControl() {
     return StreamBuilder<double>(
       stream: widget.playerEngine.volumeStream,
@@ -3755,14 +4225,20 @@ class _DesktopVideoPlayerState extends State<DesktopVideoPlayer> {
             ),
             // 音量条与静音按钮同一盒高：整行（含滑条）都是 36 高，
             // 滑条不再把 Row 撑到 44 而让图标中线跟着偏。
+            // 原先 70 宽被 Slider 默认左 10 / 右 20 的内边距吃掉一半，
+            // 有效轨道只有 40px；加宽到 100 并给对称 padding。
             SizedBox(
-              width: 70,
+              width: 100,
               height: _controlHitSize,
-              child: Overlay.wrap(
-                alwaysSizeToContent: true,
-                clipBehavior: Clip.none,
-                child: SliderTheme(
+              // 与进度条同理：音量滑块自己的 portal 锚点，避免两者共用祖先语义节点。
+              child: Semantics(
+                container: true,
+                child: Overlay.wrap(
+                  alwaysSizeToContent: true,
+                  clipBehavior: Clip.none,
+                  child: SliderTheme(
                   data: SliderTheme.of(context).copyWith(
+                    padding: const EdgeInsets.symmetric(horizontal: 6),
                     trackHeight: 2.5,
                     thumbShape:
                         const RoundSliderThumbShape(enabledThumbRadius: 4),
@@ -3782,10 +4258,46 @@ class _DesktopVideoPlayerState extends State<DesktopVideoPlayer> {
                   ),
                 ),
               ),
+              ),
             ),
           ],
         );
       },
+    );
+  }
+}
+
+/// 「视频信息」弹窗里的一行：固定宽度标签 + 可换行内容，长 URL 不会撑破弹窗。
+class _VideoInfoRow extends StatelessWidget {
+  const _VideoInfoRow({required this.label, required this.value});
+
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) {
+    final palette = context.palette;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 3),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 68,
+            child: Text(
+              label,
+              style: TextStyle(color: palette.textSub, fontSize: AppType.label),
+            ),
+          ),
+          Expanded(
+            child: Text(
+              value,
+              style: TextStyle(color: palette.textMain, fontSize: AppType.label),
+              softWrap: true,
+            ),
+          ),
+        ],
+      ),
     );
   }
 }
@@ -3799,6 +4311,7 @@ class _DesktopVideoPlayerState extends State<DesktopVideoPlayer> {
 class _ControlButton extends StatelessWidget {
   final IconData icon;
   final double iconSize;
+  final Color? iconColor;
   final VoidCallback? onPressed;
   final bool busy;
 
@@ -3806,6 +4319,7 @@ class _ControlButton extends StatelessWidget {
     super.key,
     required this.icon,
     this.iconSize = 20,
+    this.iconColor,
     this.onPressed,
     this.busy = false,
   });
@@ -3834,8 +4348,9 @@ class _ControlButton extends StatelessWidget {
               : Icon(
                   icon,
                   size: iconSize,
-                  color:
-                      enabled ? _chromeInk : _chromeInk.withValues(alpha: 0.38),
+                  color: enabled
+                      ? (iconColor ?? _chromeInk)
+                      : _chromeInk.withValues(alpha: 0.38),
                 ),
           padding: EdgeInsets.zero,
           constraints: const BoxConstraints.tightFor(

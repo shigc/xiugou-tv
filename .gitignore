@@ -53,6 +53,7 @@ doc/
 .do-it/
 .learnings/
 .codex/
+.qoder/
 .agents/
 .agent/
 .claude/
@@ -187,8 +188,11 @@ $RECYCLE.BIN/
 # ---- 仓库只保留「clone 后可构建」的最小集合 ----
 /scripts/measure_memory_idle.ps1
 /companion/test_service.ps1
-/test/
-/android-bridge/test/
+# /test/ 曾被整体排除，导致 clone 下来没有任何单测可跑（`flutter test` 无测试），
+# 与 AGENTS.md §5 的验证清单矛盾。只放行真正的 Dart 单测，其余（夹具 / jar / 报告）仍忽略。
+/test/*
+!/test/core/
+!/test/ui/
 /web/
 /scripts/tests/
 /scripts/js_bridge_regression.py

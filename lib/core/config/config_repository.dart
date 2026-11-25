@@ -4,6 +4,8 @@ import 'dart:io';
 import 'package:dio/dio.dart';
 import '../api/models/vod_models.dart';
 import '../companion/companion_spider_api.dart';
+import '../diagnostics/app_logger.dart';
+import '../follow/follow_record.dart';
 import '../history/history_match.dart';
 import '../danmaku/danmaku_api.dart';
 import '../net/ascii_url.dart';
@@ -163,6 +165,9 @@ class ConfigRepository {
   List<VodItem> _favorites = [];
   List<Live> _liveFavorites = [];
 
+  /// 追剧记录：关注的剧集与已知集数。
+  List<FollowRecord> _follows = [];
+
   final StreamController<VodConfig> _vodConfigController =
       StreamController<VodConfig>.broadcast();
   final StreamController<DesktopWindowConfig> _windowConfigController =
@@ -175,6 +180,8 @@ class ConfigRepository {
       StreamController<List<VodItem>>.broadcast();
   final StreamController<List<Live>> _liveFavoritesController =
       StreamController<List<Live>>.broadcast();
+  final StreamController<List<FollowRecord>> _followsController =
+      StreamController<List<FollowRecord>>.broadcast();
   final StreamController<ConfigLoadEvent> _configLoadedController =
       StreamController<ConfigLoadEvent>.broadcast();
 
@@ -205,6 +212,10 @@ class ConfigRepository {
         _proxyDioFactory = proxyDio ?? _defaultProxyDio,
         _catSourceLoader =
             catSourceLoader ?? CompanionSpiderApi().importCatSource;
+
+  /// 清单类数据落盘失败：内存虽已回滚，但错误必须留下证据（UI 只显示一句提示）。
+  void _logPersistFailure(String what, Object error) =>
+      AppLogger.instance.error('config', '$what 落盘失败，已回滚内存状态', error: error);
 
   /// 先直连；仅在传输失败且存在系统代理时重试一次，保留原始失败原因。
   ///
@@ -388,6 +399,7 @@ class ConfigRepository {
         await _storage.saveHomeSitePreferences(snapshot);
         if (revision == _homeSiteRevision) _homeSiteSaveError = null;
       } catch (error) {
+        _logPersistFailure('首页站源偏好', error);
         if (revision == _homeSiteRevision) {
           _homeSiteSaveError = error is DataRestorePendingRestartException
               ? '数据已恢复，请重启应用后再设置首页站源（本次修改未保存）。'
@@ -409,6 +421,10 @@ class ConfigRepository {
   String? get currentSourceLocation => _currentSourceLocation;
   String? get sourceRecoveryError => _sourceRecoveryError;
 
+  /// 本轮没能读成功、因而禁止覆盖写的数据文件名（如 `history.json`）。
+  ///
+  /// 非空时设置页要如实提示：内存里那份空表是读失败的产物，不是用户的真实数据。
+  Set<String> get unreadableDataFiles => _storage.unreadableDataFiles;
   List<HistoryRecord> get historyRecords => List.unmodifiable(_historyRecords);
 
   /// 当前播放历史保留上限（由设置同步；默认 [defaultHistoryLimit]）
@@ -417,6 +433,9 @@ class ConfigRepository {
 
   /// 直播收藏（§33）。与点播收藏是两份独立数据：一个存 `VodItem`，一个存 `Live`。
   List<Live> get liveFavorites => List.unmodifiable(_liveFavorites);
+
+  /// 追剧记录列表（不可变快照）。
+  List<FollowRecord> get follows => List.unmodifiable(_follows);
 
   Stream<VodConfig> get vodConfigStream async* {
     yield _currentVodConfig;
@@ -448,6 +467,12 @@ class ConfigRepository {
     yield* _liveFavoritesController.stream;
   }
 
+  /// 追剧记录变更流。
+  Stream<List<FollowRecord>> get followsStream async* {
+    yield List.unmodifiable(_follows);
+    yield* _followsController.stream;
+  }
+
   /// 初始化：从 Windows 本地持久化中恢复窗口配置与缓存的影视配置
   Future<void> initialize() async {
     _credentials.replaceAll(await _storage.readConfigCredentials());
@@ -467,7 +492,9 @@ class ConfigRepository {
         final cachedVod = await _storage.readCachedVodConfig();
         if (cachedVod != null) _applyVodConfig(cachedVod);
       }
-    } catch (_) {
+    } catch (error) {
+      AppLogger.instance.error('config', '当前配置快照读取失败，原文件已保留',
+          error: error);
       _sourceRecoveryError = '当前配置快照读取失败，原文件已保留。请重新导入配置；不会自动恢复旧订阅。';
       _currentWindowConfig = _currentWindowConfig
           .copyWith(clearLastConfigUrl: true, depotPath: const []);
@@ -482,6 +509,10 @@ class ConfigRepository {
 
     _liveFavorites = await _storage.readLiveFavorites();
     _liveFavoritesController.add(_liveFavorites);
+
+    // 读取追剧记录（在首次 UI 构建前就绪，便于详情弹窗判断是否已追）。
+    _follows = await _storage.readFollows();
+    _followsController.add(List.unmodifiable(_follows));
 
     // 如果此前保存了配置 URL，尝试后台异步更新最新配置
     final lastUrl = _currentWindowConfig.lastConfigUrl;
@@ -673,6 +704,9 @@ class ConfigRepository {
 
   /// 清空全部历史记录
   Future<void> clearHistory() async {
+    // 「清空」是用户对这份文件的明确处置：即便上一轮没能读成功（受保护状态），
+    // 这次也必须真的写下去，否则用户看到列表空了、下次开机历史又回来。
+    _storage.allowHistoryOverwrite();
     _historyRecords.clear();
     _publishHistory();
     await _persistHistory();
@@ -696,7 +730,8 @@ class ConfigRepository {
     _favoritesController.add(_favorites);
     try {
       await _storage.saveFavorites(_favorites);
-    } catch (_) {
+    } catch (error) {
+      _logPersistFailure('收藏', error);
       if (removed != null) {
         // 回退原对象而不是入参，避免把已收藏条目的字段（siteKey 等）降级。
         _favorites.insert(index, removed);
@@ -717,9 +752,110 @@ class ConfigRepository {
     _favoritesController.add(_favorites);
     try {
       await _storage.saveFavorites(_favorites);
-    } catch (_) {
+    } catch (error) {
+      _logPersistFailure('取消收藏', error);
       _favorites.insert(index, removed);
       _favoritesController.add(_favorites);
+      rethrow;
+    }
+  }
+
+  // ==================== 追剧 ====================
+
+  /// 该片是否已在追（同站同片唯一）。
+  bool isFollowing(String? siteKey, String vodId) =>
+      _follows.any((e) => e.id == FollowRecord.buildId(siteKey, vodId));
+
+  /// 取某片的追剧记录；未追返回 null。
+  FollowRecord? followRecordFor(String? siteKey, String vodId) {
+    final id = FollowRecord.buildId(siteKey, vodId);
+    for (final record in _follows) {
+      if (record.id == id) return record;
+    }
+    return null;
+  }
+
+  /// 切换追剧状态（乐观更新 + 落盘失败回滚，模板同 [toggleFavorite]）。
+  ///
+  /// [totalEpisodes] 为当前详情探测到的总集数（取最长线路）；追上已有记录时
+  /// 只在变大的情况下刷新；[seenEpisodes] 为已看集数（新追时若有观看历史可预填）。
+  Future<bool> toggleFollow(
+    VodItem item, {
+    int? totalEpisodes,
+    int seenEpisodes = 0,
+  }) async {
+    final id = FollowRecord.buildId(item.siteKey, item.id);
+    final index = _follows.indexWhere((e) => e.id == id);
+    FollowRecord? removed;
+    bool following;
+    if (index >= 0) {
+      removed = _follows.removeAt(index);
+      following = false;
+    } else {
+      _follows.insert(
+        0,
+        FollowRecord(
+          id: id,
+          vodId: item.id,
+          vodName: item.name,
+          vodPic: item.pic,
+          siteKey: item.siteKey,
+          siteName: item.siteName,
+          knownEpisodes: totalEpisodes ?? 0,
+          seenEpisodes: seenEpisodes,
+          followedAt: DateTime.now(),
+          lastCheckedAt: DateTime.now(),
+        ),
+      );
+      following = true;
+    }
+    _followsController.add(List.unmodifiable(_follows));
+    try {
+      await _storage.saveFollows(_follows);
+    } catch (error) {
+      _logPersistFailure('追剧', error);
+      if (removed != null) {
+        _follows.insert(index, removed);
+      } else {
+        _follows.removeWhere((e) => e.id == id);
+      }
+      _followsController.add(List.unmodifiable(_follows));
+      rethrow;
+    }
+    return following;
+  }
+
+  /// 移除追剧记录；落盘失败时恢复原位置并抛错。
+  Future<void> removeFollow(String id) async {
+    final index = _follows.indexWhere((e) => e.id == id);
+    if (index < 0) return;
+    final removed = _follows.removeAt(index);
+    _followsController.add(List.unmodifiable(_follows));
+    try {
+      await _storage.saveFollows(_follows);
+    } catch (error) {
+      _logPersistFailure('取消追剧', error);
+      _follows.insert(index, removed);
+      _followsController.add(List.unmodifiable(_follows));
+      rethrow;
+    }
+  }
+
+  /// 批量应用探测结果（探测期间用户可能改动列表：只更新仍存在的记录），
+  /// 一次发布 + 一次落盘；失败回滚到更新前快照并抛错。
+  Future<void> applyFollowCheckResults(List<FollowRecord> results) async {
+    if (results.isEmpty) return;
+    final snapshot = List.of(_follows);
+    for (final updated in results) {
+      final index = _follows.indexWhere((e) => e.id == updated.id);
+      if (index >= 0) _follows[index] = updated;
+    }
+    _followsController.add(List.unmodifiable(_follows));
+    try {
+      await _storage.saveFollows(_follows);
+    } catch (_) {
+      _follows = snapshot;
+      _followsController.add(List.unmodifiable(_follows));
       rethrow;
     }
   }
@@ -744,7 +880,8 @@ class ConfigRepository {
     _liveFavoritesController.add(_liveFavorites);
     try {
       await _storage.saveLiveFavorites(_liveFavorites);
-    } catch (_) {
+    } catch (error) {
+      _logPersistFailure('直播收藏', error);
       if (favorited) {
         _liveFavorites.removeWhere((entry) => identical(entry, channel));
       } else {
@@ -767,7 +904,8 @@ class ConfigRepository {
     _liveFavoritesController.add(_liveFavorites);
     try {
       await _storage.saveLiveFavorites(_liveFavorites);
-    } catch (_) {
+    } catch (error) {
+      _logPersistFailure('取消直播收藏', error);
       _liveFavorites.insert(index, removed);
       _liveFavoritesController.add(_liveFavorites);
       rethrow;
@@ -831,8 +969,10 @@ class ConfigRepository {
     _credentials.put(credentials);
     try {
       await _storage.saveConfigCredentials(_credentials.entries);
-    } catch (_) {
-      // 落盘失败只影响下次启动是否需要重新输入，不阻断本次加载。
+    } catch (error) {
+      // 落盘失败只影响下次启动是否需要重新输入，不阻断本次加载（不记凭据内容）。
+      AppLogger.instance.warning('config', '站点凭据落盘失败，下次可能需要重新输入',
+          error: error);
     }
   }
 
@@ -1158,6 +1298,8 @@ class ConfigRepository {
       await _storage.saveCurrentConfig(snapshot);
       if (_disposed) throw const ConfigLoadSuperseded();
       _applySnapshot(snapshot, parsed);
+      AppLogger.instance.info('config',
+          '配置已更新：${parsed.sites.length} 个站源、${parsed.lives.length} 个直播源');
       if (snapshot.sourceKind != null) {
         _emitLoaded(snapshot.sourceKind!, snapshot.sourceLocation!, parsed);
       }
@@ -1542,6 +1684,7 @@ class ConfigRepository {
   /// 切换当前使用的点播站点
   void selectSite(Site site) {
     _selectedSite = site;
+    AppLogger.instance.info('config', '切换站源：${site.name} (${site.key})');
     _siteController.add(_selectedSite);
   }
 
@@ -1658,6 +1801,7 @@ class ConfigRepository {
     await _siteController.close();
     await _historyController.close();
     await _favoritesController.close();
+    await _followsController.close();
     await _configLoadedController.close();
   }
 }

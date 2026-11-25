@@ -327,6 +327,17 @@ New-Item -ItemType Directory -Path $TargetRuntimeDir -Force | Out-Null
 Copy-Item -LiteralPath $EmbeddedJre -Destination $TargetRuntimeDir -Recurse -Force
 Write-Host "  [+] Bundled embedded JRE to release directory." -ForegroundColor Green
 
+# 内置画质增强着色器（Anime4K 风格，本地实现）：随安装包分发，供播放器设置启用。
+$SourceShadersDir = Join-Path $ProjectRoot "runtime/shaders"
+if (Test-Path -LiteralPath $SourceShadersDir -PathType Container) {
+    $TargetShadersDir = Join-Path $TargetRuntimeDir "shaders"
+    Copy-Item -LiteralPath $SourceShadersDir -Destination $TargetRuntimeDir -Recurse -Force
+    $ShaderCount = (Get-ChildItem -LiteralPath $TargetShadersDir -Recurse -File).Count
+    Write-Host "  [+] Bundled $ShaderCount shader file(s) to release directory (runtime/shaders)." -ForegroundColor Green
+} else {
+    Write-Host "  [*] No runtime/shaders to bundle; skipping." -ForegroundColor DarkGray
+}
+
 # 3.3 VC++ 运行库应用本地部署（issue #2：用户机未装 vc_redist 时报缺 VCRUNTIME140_1.dll、打不开）。
 # xiugou_tv.exe 与各插件 DLL 以 /MD 链接 MSVCP140 / VCRUNTIME140 / VCRUNTIME140_1；Windows 先在 exe 目录
 # 找 DLL，因此随包放一份即可。来源优先取 VS 自带的可再发行目录（与编译器同版本），找不到才退回 System32。
@@ -364,6 +375,7 @@ foreach ($crtFile in $VcCrtFiles) {
 }
 $crtVersion = (Get-Item -LiteralPath (Join-Path $BuildOutputDir "msvcp140.dll")).VersionInfo.FileVersion
 Write-Host "  [+] Bundled $($VcCrtFiles -join ', ') ($crtVersion) from $VcCrtSource" -ForegroundColor Green
+
 
 # Ensure dist directory exists
 if (-not (Test-Path $DistDir)) {

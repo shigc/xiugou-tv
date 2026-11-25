@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:path/path.dart' as p;
 
 import '../config/windows_config_storage.dart';
+import '../diagnostics/app_logger.dart';
 import 'app_data_files.dart';
 
 /// 用户数据文件的可读状态（只读 stat，不读内容）。
@@ -181,11 +182,14 @@ class CacheMaintenance {
         failed++;
       }
     }
-    return TempCleanupResult(
+    final result = TempCleanupResult(
       deleted: deleted,
       skipped: skipped,
       failed: failed,
     );
+    AppLogger.instance.info('storage',
+        '孤儿临时文件清理：删除 $deleted、跳过 $skipped、失败 $failed');
+    return result;
   }
 
   Future<Directory?> _resolveDirectory() async {

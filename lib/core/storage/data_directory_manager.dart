@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:crypto/crypto.dart';
 import 'package:path/path.dart' as p;
 
+import '../diagnostics/app_logger.dart';
 import 'app_data_files.dart';
 
 /// 数据目录状态（启动时解析一次，供设置页展示）。
@@ -281,6 +282,7 @@ class DataDirectoryManager {
           defaultPath: defaultPath,
         );
         if (result.ok) {
+          AppLogger.instance.info('storage', '数据目录迁移完成：$pendingPath');
           // 迁到安装目录下的 user_data 时也不写指针：便携目录一旦有数据，下次启动
           // 就会成为默认目录，留一个指向它的指针只会在之后变成孤儿标记。
           final targetIsPortable = _isPortableDirectory(pendingPath);
@@ -299,6 +301,7 @@ class DataDirectoryManager {
           unavailable = null;
         } else {
           pendingError = result.message ?? '迁移失败';
+          AppLogger.instance.warning('storage', '数据目录迁移失败：$pendingError');
         }
       }
     }
@@ -320,11 +323,14 @@ class DataDirectoryManager {
         defaultPath: defaultPath,
       );
       if (moved.ok) {
+        AppLogger.instance.info(
+            'storage', '自动搬迁到便携数据目录：${portableDirectoryPath()}');
         active = portableDirectoryPath();
         customPath = null;
       } else {
-        _recordAutoMigrateFailure(
-            defaultPath, moved.message ?? '迁移失败');
+        final reason = moved.message ?? '迁移失败';
+        AppLogger.instance.warning('storage', '自动搬迁到便携数据目录失败：$reason');
+        _recordAutoMigrateFailure(defaultPath, reason);
       }
     }
 

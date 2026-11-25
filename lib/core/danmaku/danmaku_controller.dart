@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/foundation.dart';
 
+import '../diagnostics/app_logger.dart';
 import 'danmaku_api.dart';
 import 'danmaku_cache.dart';
 import 'danmaku_matcher.dart';
@@ -323,7 +324,7 @@ class DanmakuController extends ValueNotifier<DanmakuState> {
       key == _manualKey ? _manualCandidate : null;
 
   /// 诊断日志：只记片名 / 集名 / 候选名，不记服务地址（地址里带访问令牌）。
-  static void _log(String message) => debugPrint('[danmaku] $message');
+  static void _log(String message) => AppLogger.instance.debug('danmaku', message);
 
   /// 取消在途请求并清空（退出播放 / 直播 / 关闭弹幕时）。
   ///

@@ -299,6 +299,13 @@ class HistoryDialog extends StatelessWidget {
   }
 }
 
+/// 扁平列表里的分组标题项（与 [HistoryRecord] 区分用的小载体）。
+class _HeaderItem {
+  final String title;
+  final int count;
+  const _HeaderItem(this.title, this.count);
+}
+
 /// 日期分组标题（今天 / 昨天 / 本周 / 更早）
 class _SectionHeader extends StatelessWidget {
   final String title;
@@ -384,6 +391,7 @@ class _HistoryCardState extends State<_HistoryCard> {
       semanticLabel: record.vodName,
       borderRadius: const BorderRadius.all(Radius.circular(AppRadii.md)),
       child: MouseRegion(
+        cursor: SystemMouseCursors.click,
         onEnter: (_) => setState(() => _isHovered = true),
         onExit: (_) => setState(() => _isHovered = false),
         child: GestureDetector(

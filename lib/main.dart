@@ -1,12 +1,14 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:path/path.dart' as p;
 import 'app.dart';
 import 'core/app_info.dart';
 import 'core/companion/companion_playback_lease.dart';
 import 'core/companion/companion_process_manager.dart';
 import 'core/config/config_repository.dart';
 import 'core/config/models/builtin_sites.dart';
+import 'core/diagnostics/app_logger.dart';
 import 'core/diagnostics/error_log.dart';
 import 'core/net/http_client_factory.dart';
 import 'core/danmaku/danmaku_api.dart';
@@ -15,6 +17,7 @@ import 'core/settings/models/appearance_preferences.dart';
 import 'core/settings/settings_repository.dart';
 import 'core/storage/app_data_reset.dart';
 import 'core/storage/data_directory_manager.dart';
+import 'ui/desktop/widgets/app_crash_placeholder.dart';
 import 'ui/desktop/window/desktop_window_manager.dart';
 import 'ui/theme/app_icon_assets.dart';
 import 'ui/theme/app_palette.dart';
@@ -22,39 +25,61 @@ import 'ui/theme/app_palette.dart';
 Future<void> main() async {
   runZonedGuarded(() async {
     WidgetsFlutterBinding.ensureInitialized();
+    final log = AppLogger.instance;
     // ⑥ 内存批：海报 / 台标等网络图解码缓存默认上限 100MB，收紧到 48MB；
     // 超出按 LRU 淘汰、重复浏览会再解码，换取常驻内存下降。
     PaintingBinding.instance.imageCache.maximumSizeBytes = 48 << 20;
-    await loadAppVersionLabel();
-    // §43：可选服务是否启用（只打印是否配置，不打印地址 / 令牌）
-    debugPrint('[xiugou-tv] 弹幕服务：${danmakuServiceConfigured ? '已配置' : '未配置（config/app.env）'}');
-
-    // 先解析数据目录并执行待定迁移，再创建任何存储（避免运行中双目录写入）。
-    // 便携版默认目录是 exe 旁的 user_data，重置标记也放在默认目录，所以必须先解析。
-    try {
-      await DataDirectoryManager.initialize();
-    } catch (error) {
-      debugPrint('[xiugou-tv] data directory init failed: $error');
-    }
+    // 版本号读取与数据目录解析互不依赖，并行做掉，缩短 runApp 前的串行等待。
+    String? versionLabel;
+    await Future.wait<void>([
+      () async {
+        versionLabel = await loadAppVersionLabel();
+      }(),
+      () async {
+        // 先解析数据目录并执行待定迁移，再创建任何存储（避免运行中双目录写入）。
+        // 便携版默认目录是 exe 旁的 user_data，重置标记也放在默认目录，所以必须先解析。
+        try {
+          await DataDirectoryManager.initialize();
+          log.info('startup', '数据目录：${DataDirectoryManager.currentPath}');
+        } catch (error) {
+          log.error('startup', '数据目录初始化失败', error: error);
+        }
+      }(),
+    ]);
+    log.info('startup', '启动，版本 ${versionLabel ?? '未知'}');
+    // §43：可选服务是否启用（只记录是否配置，不记录地址 / 令牌）
+    log.info('startup', '弹幕服务：${danmakuServiceConfigured ? '已配置' : '未配置（config/app.env）'}');
 
     // 关于页「重置所有设置」：上次会话安排的全部清空，在创建任何存储之前执行
     try {
       if (await AppDataReset.applyPendingAtStartup()) {
-        debugPrint('[xiugou-tv] 已按上次的「重置所有设置」清空数据目录');
+        log.info('startup', '已按上次的「重置所有设置」清空数据目录');
       }
     } catch (error) {
-      debugPrint('[xiugou-tv] reset failed: $error');
+      log.error('startup', '重置所有设置失败', error: error);
     }
 
     // 关于页「错误日志」：本次运行期间的未捕获异常、框架错误、播放器报错，只放内存（关闭即清空）
     final previousOnError = FlutterError.onError;
     FlutterError.onError = (details) {
-      ErrorLog.instance.record('界面', details.exception, details.stack);
+      ErrorLog.instance.record('界面', details.exception, details.stack,
+          AppLogLevel.fatal);
       previousOnError?.call(details);
     };
+    // FlutterError.onError 只接得住 widget 树内的框架错误。引擎回调、platform
+    // channel、isolate 里的异步错误跑在 root zone，连 runZonedGuarded 都接不住——
+    // 不挂这一层，最严重的崩溃恰恰是没记录的那批。
+    WidgetsBinding.instance.platformDispatcher.onError = (error, stack) {
+      ErrorLog.instance.record('未捕获异常', error, stack, AppLogLevel.fatal);
+      return true;
+    };
+    // 生产构建下 widget build 崩溃时给一块品牌化占位，而不是刺眼的红屏。
+    ErrorWidget.builder = (details) => AppCrashPlaceholder(details: details);
 
     final configRepository = ConfigRepository(fallbackHomeSite: builtinDoubanSite);
     await configRepository.initialize();
+    log.info('config', '配置已加载：${configRepository.currentVodConfig.sites.length} 个站源，'
+        '${configRepository.currentVodConfig.lives.length} 个直播源');
 
     final settingsRepository = SettingsRepository();
     await settingsRepository.initialize(
@@ -93,6 +118,11 @@ Future<void> main() async {
     final windowManager = DesktopWindowManager(
       configRepository: configRepository,
       beforeClose: () async {
+        log.info('startup', '退出清理：停止播放并关闭 companion');
+        // 退出前先关掉语义树：窗口隐藏后 overlay portal（滑块 / Tooltip）的锚点会在
+        // teardown 中被拆除，若无障碍桥仍开启，孤儿节点会让 AXTree 更新整批失败并刷屏。
+        // 只在真正退出时关闭，不影响运行期屏幕阅读器。
+        WidgetsBinding.instance.platformDispatcher.setSemanticsTreeEnabled(false);
         try {
           await playerEngine.stop().timeout(const Duration(milliseconds: 500));
         } catch (_) {
@@ -110,15 +140,18 @@ Future<void> main() async {
       AppThemeMode.system =>
         WidgetsBinding.instance.platformDispatcher.platformBrightness,
     };
+    final startupPalette = themePresetByName(appearance.themePreset);
     await windowManager.initialize(
       backgroundColor: initialBrightness == Brightness.dark
-          ? AppPalette.dark.background
-          : AppPalette.light.background,
+          ? startupPalette.dark.background
+          : startupPalette.light.background,
       iconPath: appIconFilePath(),
     );
+    log.info('startup', '窗口与设置初始化完成');
 
     // 冷启动有效主入口：启动偏好 +「上次入口」解析（失败按点播首页）
     final startupEntry = settingsRepository.startupPreferences.effectiveEntry;
+    log.info('startup', '初始入口：${startupEntry.name}');
 
     // 初始化时捕获默认音量 / 倍速；之后只更新即时参数，不覆盖当前播放默认值
     unawaited(
@@ -131,6 +164,17 @@ Future<void> main() async {
     settingsRepository.playerSettingsStream
         .skip(1)
         .listen(playerEngine.applyPlaybackSettings);
+
+    // 视频本地缓存：默认根 = 数据目录/video_cache；偏好变化即时生效（目录 / 上限 / 开关）
+    final cacheDefaultRoot =
+        p.join(DataDirectoryManager.currentPath, 'video_cache');
+    unawaited(playerEngine.applyCachePreferences(
+        settingsRepository.videoCachePreferences,
+        defaultRoot: cacheDefaultRoot));
+    settingsRepository.videoCachePreferencesStream.skip(1).listen((prefs) {
+      unawaited(playerEngine.applyCachePreferences(prefs,
+          defaultRoot: cacheDefaultRoot));
+    });
 
     runApp(
       ProviderScope(
@@ -145,9 +189,20 @@ Future<void> main() async {
       ),
     );
 
+    log.info('player', '播放器初始化开始');
     unawaited(playerEngine.initialize());
+
+    // 起播提速：把 JVM 冷启动挪出点播管线。此前 Spider 站首播要把
+    // companion 懒启动（探端口 + 健康检查）整个算进用户等待；
+    // 现在首帧渲染后空闲预热，30 分钟无使用仍会自动停用，回落懒启动。
+    if (configRepository.currentVodConfig.sites.any((s) => s.usesCompanion)) {
+      log.info('companion', '检测到爬虫站源，安排空闲预热');
+      Timer(const Duration(milliseconds: 800), () {
+        unawaited(companionManager.start());
+      });
+    }
   }, (error, stack) {
-    debugPrint('[xiugou-tv] startup error: $error\n$stack');
-    ErrorLog.instance.record('未捕获异常', error, stack);
+    // ErrorLog.record 会同时写内存与 app.log（fatal 级别），且不会向外抛异常。
+    ErrorLog.instance.record('未捕获异常', error, stack, AppLogLevel.fatal);
   });
 }

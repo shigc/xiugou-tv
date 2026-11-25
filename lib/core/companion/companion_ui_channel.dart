@@ -4,6 +4,7 @@ import 'dart:convert';
 import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
 
+import '../diagnostics/app_logger.dart';
 import '../net/http_client_factory.dart';
 import 'spider_ui_models.dart';
 
@@ -155,13 +156,14 @@ class CompanionUiChannel {
       if (!accepted) {
         // 载荷已不认这个弹窗，之后也不会再发 dismiss：本地按已关闭处理
         _openDialogs.remove(input.dialogId);
-        debugPrint(
-            '[spider-ui] 操作未被接受：dialog=${input.dialogId} type=${input.type}');
+        AppLogger.instance.warning('spider-ui',
+            '操作未被接受：dialog=${input.dialogId} type=${input.type}');
       }
       return accepted;
     } catch (e) {
-      debugPrint('[spider-ui] 操作发送失败：dialog=${input.dialogId} '
-          'type=${input.type} error=${e.runtimeType}');
+      AppLogger.instance.error('spider-ui',
+          '操作发送失败：dialog=${input.dialogId} type=${input.type}',
+          error: e);
       return false;
     }
   }

@@ -137,8 +137,10 @@ class _DanmakuLayerState extends State<DanmakuLayer> with SingleTickerProviderSt
   void didUpdateWidget(DanmakuLayer old) {
     super.didUpdateWidget(old);
     if (old.positionStream != widget.positionStream) _subscribe();
+    // 透明度现在参与排版缓存的字色合成，改动必须让缓存重建（见 _painterFor）
     final styleChanged = old.settings.fontWeight != widget.settings.fontWeight ||
         old.settings.strokeWidth != widget.settings.strokeWidth ||
+        old.settings.opacity != widget.settings.opacity ||
         (old.fontSize ?? old.settings.fontSize) != _fontSize;
     final layoutChanged = styleChanged ||
         old.settings != widget.settings ||
@@ -184,9 +186,17 @@ class _DanmakuLayerState extends State<DanmakuLayer> with SingleTickerProviderSt
 
   TextPainter _painterFor(DanmakuItem item) => _painters.putIfAbsent(item, () {
         final s = widget.settings;
-        final color = Color(0xFF000000 | item.color);
+        // 整体透明度直接乘进文字色与描边色，而不是每帧开一层全屏离屏（canvas.saveLayer）。
+        // 后者在 4K 全屏下单帧就要分配约 33MB 离屏缓冲，是本项目单帧开销最高的一处；
+        // 逐条乘 alpha 的观感差异极小（弹幕按轨道排布，本就极少互相重叠）。
+        final fade = s.opacity.clamp(0.0, 1.0);
+        final base = Color(0xFF000000 | item.color);
+        final color = fade >= 0.999 ? base : base.withValues(alpha: fade);
         final weight = FontWeight.values[((s.fontWeight ~/ 100) - 1).clamp(0, 8)];
         final stroke = s.strokeWidth;
+        final strokeColor = fade >= 0.999
+            ? const Color(0xE6000000)
+            : Color.fromARGB((0xE6 * fade).round().clamp(0, 255), 0, 0, 0);
         // 描边：用 4 向 + 4 角的零模糊阴影近似（Flutter 文本描边需双层绘制，阴影更省）
         final shadows = <Shadow>[
           if (stroke > 0)
@@ -194,7 +204,7 @@ class _DanmakuLayerState extends State<DanmakuLayer> with SingleTickerProviderSt
               Offset(1, 0), Offset(-1, 0), Offset(0, 1), Offset(0, -1),
               Offset(0.7, 0.7), Offset(-0.7, 0.7), Offset(0.7, -0.7), Offset(-0.7, -0.7),
             ])
-              Shadow(color: const Color(0xE6000000), offset: o * stroke),
+              Shadow(color: strokeColor, offset: o * stroke),
         ];
         return TextPainter(
           text: TextSpan(
@@ -287,10 +297,6 @@ class _DanmakuPainter extends CustomPainter {
     final t = time.value;
     final visible = layout.advance(t);
     final now = <DanmakuItem>{};
-    final useLayer = opacity < 0.999;
-    if (useLayer) {
-      canvas.saveLayer(Offset.zero & size, Paint()..color = Color.fromRGBO(0, 0, 0, opacity));
-    }
     // 底部弹幕从显示区域的下沿往上排（区域 < 全屏时不贴到画面最底下）
     final areaBottom = size.height * layout.config.areaFraction;
     for (final d in visible) {
@@ -312,7 +318,6 @@ class _DanmakuPainter extends CustomPainter {
       }
       tp.paint(canvas, Offset(x, y + (lineHeight - tp.height) / 2));
     }
-    if (useLayer) canvas.restore();
     // 离屏的弹幕释放排版缓存，避免 4 万条全堆在内存里
     final gone = _prev.difference(now);
     if (gone.isNotEmpty) onRetire(gone);

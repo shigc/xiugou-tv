@@ -20,6 +20,7 @@ import 'core/api/rating_picker.dart';
 import 'core/api/search_cancel_token.dart';
 import 'core/api/search_engine.dart';
 import 'core/api/tmdb_repository.dart';
+import 'core/api/search_grouping.dart';
 import 'core/app_info.dart';
 import 'core/companion/companion_ui_channel.dart';
 import 'core/companion/companion_spider_api.dart';
@@ -35,6 +36,8 @@ import 'core/config/models/history_record.dart';
 import 'core/config/models/home_site_preference.dart';
 import 'core/config/models/vod_config.dart';
 import 'core/live/live_playback_mode.dart';
+import 'core/follow/follow_record.dart';
+import 'core/follow/follow_update_checker.dart';
 import 'core/live/live_repository.dart';
 import 'core/live/live_source.dart';
 import 'core/live/live_source_history.dart';
@@ -46,7 +49,9 @@ import 'core/danmaku/danmaku_api.dart';
 import 'core/danmaku/danmaku_cache.dart';
 import 'core/danmaku/danmaku_controller.dart';
 import 'core/danmaku/danmaku_settings.dart';
+import 'core/diagnostics/app_logger.dart';
 import 'core/danmaku/live_danmaku_client.dart';
+import 'core/dlna/dlna_cast_controller.dart';
 import 'core/segments/segments_api.dart';
 import 'core/segments/segments_controller.dart';
 import 'core/player/models/player_settings.dart';
@@ -55,6 +60,7 @@ import 'core/player/hls_playlist_probe.dart';
 import 'core/player/mpv_player_engine.dart';
 import 'core/player/muted_playback_hint.dart';
 import 'core/player/playback_http_headers.dart';
+import 'core/player/playback_failure.dart';
 import 'core/player/playback_history_tracker.dart';
 import 'core/player/playback_intent.dart';
 import 'core/player/auto_line_switch_controller.dart';
@@ -172,6 +178,13 @@ final themeModeProvider = Provider<AppThemeMode>((ref) {
   return preferences.themeMode;
 });
 
+/// 当前配色预设：默认经典蓝灰；非法持久化值回退默认。
+final themePresetProvider = Provider<AppThemePreset>((ref) {
+  final preferences = ref.watch(appearancePreferencesProvider).valueOrNull ??
+      ref.read(settingsRepositoryProvider).appearancePreferences;
+  return themePresetByName(preferences.themePreset);
+});
+
 /// 壁纸副本管理。像素探针依赖 `dart:ui`，因此在这里（UI 层）装配。
 final wallpaperStoreProvider = Provider<WallpaperStore>(
     (ref) => WallpaperStore(probeSize: probeWallpaperImageSize));
@@ -281,7 +294,8 @@ final Provider<SiteApi> siteApiProvider = Provider<SiteApi>((ref) {
       await api.resetCompanionSpiders();
       ref.read(liveRepositoryProvider).notifyScriptReset();
       await api.prewarmCompanionJars(
-          ref.read(configRepositoryProvider).currentVodConfig.sites);
+          ref.read(configRepositoryProvider).currentVodConfig.sites,
+          preferredSite: ref.read(configRepositoryProvider).selectedSite);
     }());
   });
   final readyPort = api.companionManager.readyPort;
@@ -303,7 +317,8 @@ final Provider<SiteApi> siteApiProvider = Provider<SiteApi>((ref) {
   // 启动阶段：配置在 runApp 之前就加载完了，configLoadedStream 那一次事件没有监听者，
   // 所以这里再主动预热一次（否则首次使用仍要「先全局搜索一次」才激活）。
   unawaited(api.prewarmCompanionJars(
-      ref.read(configRepositoryProvider).currentVodConfig.sites));
+      ref.read(configRepositoryProvider).currentVodConfig.sites,
+      preferredSite: ref.read(configRepositoryProvider).selectedSite));
   return api;
 });
 final parseEngineProvider = Provider<ParseEngine>((ref) => ParseEngine());
@@ -574,6 +589,34 @@ final liveFavoritesProvider =
   return LiveFavoritesNotifier(repo);
 });
 
+/// 追剧记录：关注剧集列表 + 已知集数，用于更新探测与角标。
+class FollowsNotifier extends StateNotifier<List<FollowRecord>> {
+  final ConfigRepository _repo;
+  StreamSubscription? _sub;
+
+  FollowsNotifier(this._repo) : super(_repo.follows) {
+    _sub = _repo.followsStream.listen((list) {
+      state = list;
+    });
+  }
+
+  @override
+  void dispose() {
+    _sub?.cancel();
+    super.dispose();
+  }
+}
+
+final followsProvider =
+    StateNotifierProvider<FollowsNotifier, List<FollowRecord>>((ref) {
+  final repo = ref.watch(configRepositoryProvider);
+  return FollowsNotifier(repo);
+});
+
+/// 追剧更新探测器（持有节流时间戳，会话内共享一个实例）。
+final followUpdateCheckerProvider =
+    Provider<FollowUpdateChecker>((ref) => FollowUpdateChecker());
+
 /// 弹窗探测（§40）：有模态弹窗时窗口仍要能拖动。
 final DialogRouteObserver _dialogRouteObserver = DialogRouteObserver();
 
@@ -612,6 +655,13 @@ final liveDanmakuClientProvider = Provider<LiveDanmakuClient>((ref) {
   final client = LiveDanmakuClient(onActivity: manager.notifyActivity);
   ref.onDispose(client.dispose);
   return client;
+});
+
+/// DLNA 投屏会话（全应用一份）：弹窗关闭 / 播放器重建都不中断投屏。
+final dlnaCastControllerProvider = Provider<DlnaCastController>((ref) {
+  final controller = DlnaCastController();
+  ref.onDispose(controller.dispose);
+  return controller;
 });
 
 /// §44 共享片段加载 / 提交（全应用一份；换集由 [_SegmentsSessionSync] 驱动）。
@@ -1177,15 +1227,24 @@ Future<void> _showLiveManagerDialog(BuildContext context, WidgetRef ref) async {
   );
 }
 
-/// 解析指定集数的播放地址（失败或地址为空返回 null，报错口径与既有选集一致）。
-Future<MediaPlaySpec?> _resolveEpisodeSpec(
+/// 起播解析的外层超时上限。必须比「内部最坏合法路径」更宽（spider 拉取
+/// receive 20s + 解析整轮预算 15s ≈ 35s），它只兜 companion 进程挂起这类
+/// Dio 超时管不住的无界等待——AGENTS.md §3 明确 Spider 请求可能长时间挂起。
+const Duration _playbackResolveTimeout = Duration(seconds: 45);
+
+/// 解析指定集数的播放地址。
+///
+/// 失败时除了 null 的 spec，还带回一句可展示的原因：以前所有故障都塌成 `null`，
+/// 只留一行 `[resolve]` 日志，UI 一律显示「播放解析失败，请检查站源」，
+/// 「companion 进程挂了」和「这个源本来就没地址」在用户眼里长一样
+/// （AGENTS.md §7 的「部分站点播放报错」就卡在这里没法往下查）。
+Future<({MediaPlaySpec? spec, String? error})> _resolveEpisodeSpec(
   WidgetRef ref, {
   required Site? site,
   required String sourceName,
   required String episodeUrl,
   Duration? timeout,
 }) async {
-  _lastPlayError = null;
   try {
     final future = ref.read(siteApiProvider).resolvePlayback(
           site,
@@ -1198,18 +1257,21 @@ Future<MediaPlaySpec?> _resolveEpisodeSpec(
         );
     final resolved =
         timeout == null ? await future : await future.timeout(timeout);
-    if (resolved.url.isEmpty) return null;
-    return resolved;
-  } catch (e) {
-    // 记住原因：源方「没下发内容」和「解析配置错」是两回事，别让用户去改解析。
-    // 给用户看的文案统一由 playResolveFailureText 生成，不直接显示异常原文。
-    _lastPlayError = e;
-    return null;
+    if (resolved.url.isEmpty) {
+      AppLogger.instance.warning('resolve',
+          '空地址 site=${site?.name}(${site?.key}) api=${site?.api} '
+          'flag=$sourceName url=$episodeUrl');
+      return (spec: null, error: '该线路未返回有效地址');
+    }
+    return (spec: resolved, error: null);
+  } catch (error) {
+    AppLogger.instance.error('resolve',
+        '播放地址解析异常 site=${site?.name}(${site?.key}) api=${site?.api} '
+        'flag=$sourceName url=$episodeUrl',
+        error: error);
+    return (spec: null, error: describePlaybackFailure(error));
   }
 }
-
-/// 最近一次解析播放失败的异常（由 [_resolveEpisodeSpec] 写入），交给 [playResolveFailureText] 出文案。
-Object? _lastPlayError;
 
 /// 构建目标集播放参数并写入历史记录（切集与详情页选集共用同一字段与记录 ID 规则）。
 ({MediaPlaySpec spec, String? recordId, HistoryResumeMatch? resumeMatch})
@@ -1332,21 +1394,27 @@ Future<({String? error, HistoryResumeMatch? resumeMatch})>
 
   final isStale = _playbackRequestStaleGuard(ref);
   final failed = <String>{};
+  final reasons = <String>{};
   for (final candidate in attempts) {
     if (isStale()) {
       return (error: null, resumeMatch: null);
     }
     tried.add(candidate.key);
-    final resolved = await _resolveEpisodeSpec(
+    final attempt = await _resolveEpisodeSpec(
       ref,
       site: site,
       sourceName: candidate.source.name,
       episodeUrl: candidate.episode.url,
-      timeout: attempts.length > 1 ? const Duration(seconds: 20) : null,
+      timeout: attempts.length > 1
+          ? const Duration(seconds: 20)
+          : _playbackResolveTimeout,
     );
     if (isStale()) return (error: null, resumeMatch: null);
+    final resolved = attempt.spec;
     if (resolved == null) {
       failed.add(candidate.key);
+      final reason = attempt.error;
+      if (reason != null) reasons.add(reason);
       continue;
     }
 
@@ -1367,9 +1435,10 @@ Future<({String? error, HistoryResumeMatch? resumeMatch})>
         historyRecordId: prepared.recordId,
         isStale: isStale,
       );
-    } catch (_) {
+    } catch (error) {
       if (isStale()) return (error: null, resumeMatch: null);
       failed.add(candidate.key);
+      reasons.add('播放器启动失败：${describePlaybackFailure(error)}');
       continue;
     }
     if (isStale()) {
@@ -1390,6 +1459,7 @@ Future<({String? error, HistoryResumeMatch? resumeMatch})>
       failedLines: Set.unmodifiable(failed),
     );
     ref.read(activePlaybackSessionProvider.notifier).state = session;
+    _syncFollowSeenOnPlayback(ref, session);
     ref.read(episodeBrowseSourceIndexProvider.notifier).state = null;
     if (!prepared.spec.isLive) {
       ref.read(autoLineSwitchProvider).arm(
@@ -1412,9 +1482,13 @@ Future<({String? error, HistoryResumeMatch? resumeMatch})>
     return (error: null, resumeMatch: prepared.resumeMatch);
   }
 
+  final reasonText = joinFailureReasons(reasons);
   return (
-    error:
-        playResolveFailureText(_lastPlayError, allLines: attempts.length > 1),
+    error: reasonText.isEmpty
+        ? (attempts.length > 1
+            ? '所有备用线路均不可用，请稍后重试'
+            : '播放解析失败，请检查站源或解析配置')
+        : '${attempts.length > 1 ? '所有备用线路均不可用' : '播放解析失败'}：$reasonText',
     resumeMatch: null,
   );
 }
@@ -1488,6 +1562,27 @@ void _restoreEpisodeSwitchSession(WidgetRef ref, PlaybackSession session) {
   ref.read(activePlaybackSessionProvider.notifier).state =
       session.copyWith(switching: false);
   ref.read(autoLineSwitchProvider).resumePendingAttempt();
+}
+
+/// 追剧已看集数同步：起播会话建立后，把追剧记录的 seenEpisodes 推进到本次
+/// 播放的集（同站同片才命中；只前进不后退——换站回看旧集不回退进度）。
+/// 静默失败，绝不影响播放主链路。
+void _syncFollowSeenOnPlayback(WidgetRef ref, PlaybackSession session) {
+  try {
+    final repo = ref.read(configRepositoryProvider);
+    final record = repo.followRecordFor(
+        session.item.siteKey ?? session.site?.key, session.item.id);
+    if (record == null) return;
+    final seen = (session.index + 1).clamp(0, session.episodes.length);
+    if (seen <= record.seenEpisodes) return;
+    unawaited(repo
+        .applyFollowCheckResults([
+          record.copyWith(seenEpisodes: seen, lastCheckedAt: DateTime.now()),
+        ])
+        .catchError((_) {}));
+  } catch (_) {
+    // 追剧同步失败不影响播放。
+  }
 }
 
 /// 自动换线实际执行：解析候选线路 → 启动 → 保留位置与历史记录 → 更新会话。
@@ -1650,11 +1745,12 @@ Future<({String? error, HistoryResumeMatch? resumeMatch})> _switchEpisode(
   ref.read(activePlaybackSessionProvider.notifier).state =
       session.copyWith(switching: true);
 
-  final resolved = await _resolveEpisodeSpec(
+  final attempt = await _resolveEpisodeSpec(
     ref,
     site: session.site,
     sourceName: targetSource.name,
     episodeUrl: targetSource.episodes[targetIndex].url,
+    timeout: _playbackResolveTimeout,
   );
 
   // 会话已关闭 / 被替换 / 有更新操作：迟到结果作废
@@ -1663,10 +1759,15 @@ Future<({String? error, HistoryResumeMatch? resumeMatch})> _switchEpisode(
   }
   final current = ref.read(activePlaybackSessionProvider);
   if (current == null) return (error: null, resumeMatch: null);
+  final resolved = attempt.spec;
   if (resolved == null) {
-    _restoreEpisodeSwitchSession(ref, current);
+    ref.read(activePlaybackSessionProvider.notifier).state =
+        current.copyWith(switching: false);
+    final reason = attempt.error;
     return (
-      error: playResolveFailureText(_lastPlayError),
+      error: reason == null
+          ? '播放解析失败，请检查站源或解析配置'
+          : '播放解析失败：${clipFailureReason(reason, maxChars: 60)}',
       resumeMatch: null,
     );
   }
@@ -1998,9 +2099,8 @@ Future<({String? error, bool refreshed})> _refreshPlayback(
     if (session != null) {
       // 点播剧集：重新解析当前集（与详情页选集 / 切集同一调用）
       final episode = session.episodes[session.index];
-      var timedOut = false;
-      Object? refreshError;
       MediaPlaySpec? resolved;
+      String? failureReason;
       try {
         resolved = await ref
             .read(siteApiProvider)
@@ -2019,18 +2119,18 @@ Future<({String? error, bool refreshed})> _refreshPlayback(
               parseEngine: ref.read(parseEngineProvider),
             )
             .timeout(const Duration(seconds: 20));
-        if (resolved.url.isEmpty) resolved = null;
-      } on TimeoutException {
-        timedOut = true;
-      } catch (e) {
-        refreshError = e;
+        if (resolved.url.isEmpty) {
+          resolved = null;
+          failureReason = '该线路未返回有效地址';
+        }
+      } catch (error) {
         resolved = null;
+        // 和选集/切集同一口径：把「进程故障」和「源没地址」分开说给用户。
+        failureReason = describePlaybackFailure(error);
       }
       if (isStale()) return (error: null, refreshed: false);
       if (resolved == null) {
-        error = timedOut
-            ? '刷新失败：解析超时，请稍后重试'
-            : '刷新失败：${playResolveFailureText(refreshError)}';
+        error = '刷新失败：${failureReason ?? '播放解析失败，请检查站源或解析配置'}';
       } else {
         target = resolved.copyWith(
           headers: resolved.headers ?? session.site?.header,
@@ -3810,14 +3910,15 @@ class XiugouTvApp extends ConsumerWidget {
     final isRealMpvEngine = playerEngine.runtimeType == MpvPlayerEngine;
     final trackNavs =
         isRealMpvEngine ? buildPlayerTrackNavs(playerEngine) : null;
+    final themePreset = ref.watch(themePresetProvider);
 
     return MaterialApp(
       title: '修狗TV',
       debugShowCheckedModeBanner: false,
       theme: buildAppTheme(
-          brightness: Brightness.light, palette: AppPalette.light),
+          brightness: Brightness.light, palette: themePreset.light),
       darkTheme:
-          buildAppTheme(brightness: Brightness.dark, palette: AppPalette.dark),
+          buildAppTheme(brightness: Brightness.dark, palette: themePreset.dark),
       themeMode: switch (ref.watch(themeModeProvider)) {
         AppThemeMode.dark => ThemeMode.dark,
         AppThemeMode.light => ThemeMode.light,
@@ -3863,6 +3964,7 @@ class XiugouTvApp extends ConsumerWidget {
                     ref.read(settingsRepositoryProvider).appearancePreferences;
                 return DesktopWindowFrame(
                   windowManager: windowMgr,
+                  playerActive: showPlayer,
                   onDetailBack: showSettings || showPlayer ? null : searchBridge.onDetailBack,
                   activeSiteName: activeSiteName,
                   activeSiteIcon: activeSiteIcon,
@@ -4073,6 +4175,13 @@ class XiugouTvApp extends ConsumerWidget {
                                                                 playerContext,
                                                                 ref,
                                                                 warnings))),
+                                                  ),
+                                            castNav: activePlaySpec == null ||
+                                                    prepareIntent != null
+                                                ? null
+                                                : PlayerCastNav(
+                                                    controller: ref.read(
+                                                        dlnaCastControllerProvider),
                                                   ),
                                             sourceSwitchNav: sourceSearchReady
                                                 ? PlayerSourceSwitchNav(
@@ -5262,6 +5371,8 @@ class _DesktopMainViewState extends ConsumerState<DesktopMainView> {
     if (_startupLiveEntryPending) return;
     if (!mounted) return;
     _folderRoot = null;
+    // 追剧更新探测：后台触发，探测器内部节流（30 分钟），失败静默
+    unawaited(_maybeCheckFollowUpdates());
     _searchNotice = null;
     // 首次进入主视图时预热：这里能确保配置里的站点已经加载好
     //（provider 创建时配置可能还没进来，那时站点列表为空，预热会被整条跳过）。
@@ -5271,10 +5382,12 @@ class _DesktopMainViewState extends ConsumerState<DesktopMainView> {
       _prewarmTimer = null;
       if (!mounted) return;
       unawaited(ref.read(siteApiProvider).prewarmCompanionJars(
-          ref.read(configRepositoryProvider).currentVodConfig.sites));
+          ref.read(configRepositoryProvider).currentVodConfig.sites,
+          preferredSite: ref.read(configRepositoryProvider).selectedSite));
     });
     final site = ref.read(configRepositoryProvider).selectedSite;
-    debugPrint('${site?.toJson()}'); // Map 直接打印
+    AppLogger.instance.debug('site',
+        '当前站源：${site?.name ?? '（未选择）'} (${site?.key ?? '-'})');
     final identity = _currentSiteIdentity();
     final changed = identity != _loadedSiteIdentity;
     _loadedSiteIdentity = identity;
@@ -5311,17 +5424,11 @@ class _DesktopMainViewState extends ConsumerState<DesktopMainView> {
       return;
     }
 
-    // 格式化输出切换/加载站源的清晰调试信息
-    // ignore: avoid_print
-    print('\n================ [xiugou-tv 站源调试] ================');
-    // ignore: avoid_print
-    print(
+    // info 级会镜像到控制台，保留启动排查用的 `[站源信息]` 那一行。
+    AppLogger.instance.info('site',
         '[站源信息]: ${site.name} (Key: ${site.key}, Type: ${site.type}, Api: ${site.api})');
-    // ignore: avoid_print
-    print(
-        '[当前操作]: ${category == null ? "获取站源首页推荐与动态分类" : "切换到分类: ${category.name} (ID: ${category.id})"}');
-    // ignore: avoid_print
-    print('===========================================================');
+    AppLogger.instance.debug('site',
+        '当前操作: ${category == null ? "获取站源首页推荐与动态分类" : "切换到分类: ${category.name} (ID: ${category.id})"}');
 
     setState(() {
       _isLoading = true;
@@ -5348,9 +5455,8 @@ class _DesktopMainViewState extends ConsumerState<DesktopMainView> {
         }
         final fetchedCats = homeRes.categories;
 
-        // ignore: avoid_print
-        print(
-            '--> [站源返回分类数]: ${fetchedCats.length} 个 -> [ ${fetchedCats.map((c) => "${c.name}(${c.id})").join(", ")} ]');
+        AppLogger.instance.debug('site',
+            '站源返回分类数: ${fetchedCats.length} 个 -> [ ${fetchedCats.map((c) => "${c.name}(${c.id})").join(", ")} ]');
 
         if (fetchedCats.isNotEmpty) {
           final firstCat = fetchedCats.first;
@@ -5364,8 +5470,8 @@ class _DesktopMainViewState extends ConsumerState<DesktopMainView> {
 
           // 默认加载站源第 1 个分类的数据
           if (firstCat.id.isNotEmpty) {
-            // ignore: avoid_print
-            print('--> 默认拉取第 1 个分类: ${firstCat.name} (ID: ${firstCat.id})');
+            AppLogger.instance.debug(
+                'site', '默认拉取第 1 个分类: ${firstCat.name} (ID: ${firstCat.id})');
             final extend = _filterExtendFor(firstCat);
             VodPageResult catRes;
             try {
@@ -5382,8 +5488,8 @@ class _DesktopMainViewState extends ConsumerState<DesktopMainView> {
               catRes = const VodPageResult.empty();
             }
             if (!_acceptContent(generation, identity)) return;
-            // ignore: avoid_print
-            print('--> [第 1 分类视频数]: ${catRes.list.length} 部');
+            AppLogger.instance.debug(
+                'site', '第 1 分类视频数: ${catRes.list.length} 部');
             // 空结果回退首页推荐只在无筛选时生效：带筛选的空结果是真空，要如实显示。
             final showCategory = catRes.list.isNotEmpty || extend.isNotEmpty;
             final itemsToShow = showCategory ? catRes.list : homeRes.list;
@@ -5401,8 +5507,8 @@ class _DesktopMainViewState extends ConsumerState<DesktopMainView> {
                 items: itemsToShow);
             _maybeFillCategoryPage();
           } else {
-            // ignore: avoid_print
-            print('--> [首页推荐视频数]: ${homeRes.list.length} 部');
+            AppLogger.instance.debug(
+                'site', '首页推荐视频数: ${homeRes.list.length} 部');
             if (mounted) {
               setState(() {
                 _items = homeRes.list;
@@ -5414,8 +5520,8 @@ class _DesktopMainViewState extends ConsumerState<DesktopMainView> {
           }
         } else {
           // 站源未返回分类结构，展示首页推荐数据
-          // ignore: avoid_print
-          print('--> [首页推荐视频数]: ${homeRes.list.length} 部 (站源未声明独立分类)');
+          AppLogger.instance.debug('site',
+              '首页推荐视频数: ${homeRes.list.length} 部（站源未声明独立分类）');
           if (mounted) {
             setState(() {
               _categories = [];
@@ -5447,9 +5553,8 @@ class _DesktopMainViewState extends ConsumerState<DesktopMainView> {
           ref.read(homeSiteIconProvider.notifier).state =
               (identity: identity, icon: catRes.siteIcon);
         }
-        // ignore: avoid_print
-        print(
-            '--> [分类切换成功]: ${category.name} (ID: ${category.id})，返回视频数: ${catRes.list.length} 部');
+        AppLogger.instance.debug('site',
+            '分类切换成功: ${category.name} (ID: ${category.id})，返回视频数: ${catRes.list.length} 部');
 
         if (mounted) {
           setState(() {
@@ -5466,9 +5571,11 @@ class _DesktopMainViewState extends ConsumerState<DesktopMainView> {
       final errorMsg = e is UnsupportedError
           ? (e.message?.toString() ?? e.toString())
           : '加载站点内容失败: $e';
-      // ignore: avoid_print
-      print('--> [站源数据加载失败]: '
-          '${e is SpiderCallException ? '加载站点内容失败: ${e.diagnostic}' : errorMsg}');
+      AppLogger.instance.warning('site',
+          e is SpiderCallException
+              ? '加载站点内容失败: ${e.diagnostic}'
+              : errorMsg,
+          error: e);
       _categoryHasMore = false;
       _categoryLoadingMore = false;
       if (mounted) {
@@ -6099,11 +6206,67 @@ class _DesktopMainViewState extends ConsumerState<DesktopMainView> {
     );
   }
 
+  /// 追剧更新探测（后台触发；探测器内部 30 分钟节流，切分类 / 刷新不会连发）。
+  ///
+  /// 有新集时合并成一条应用内提示；探测 / 落盘失败静默——追剧提醒不应打扰主流程。
+  Future<void> _maybeCheckFollowUpdates({bool force = false}) async {
+    final repo = ref.read(configRepositoryProvider);
+    final follows = repo.follows;
+    if (follows.isEmpty) return;
+    try {
+      final outcomes = await ref.read(followUpdateCheckerProvider).checkAll(
+            repo.currentVodConfig.sites,
+            follows,
+            ref.read(siteApiProvider),
+            force: force,
+          );
+      await repo.applyFollowCheckResults(
+          outcomes.map((o) => o.record).toList());
+      if (!mounted) return;
+      final updated = outcomes.where((o) => o.addedEpisodes > 0).toList();
+      if (updated.isEmpty) return;
+      final summary =
+          updated.map((o) => '《${o.record.vodName}》+${o.addedEpisodes}集').join('、');
+      showAppMessage('追剧更新：$summary', type: AppMessageType.success);
+    } catch (_) {
+      // 静默：更新探测失败不影响其它功能。
+    }
+  }
+
+  /// 打开详情弹窗时顺带校准追剧记录——详情已在手，这是最可靠的探测点。
+  /// 集数变大时更新记录并提示。
+  void _syncFollowFromDetail(VodDetail detail, Site? site) {
+    final repo = ref.read(configRepositoryProvider);
+    final record = repo.followRecordFor(site?.key, detail.item.id);
+    if (record == null) return;
+    var latest = 0;
+    for (final source in detail.sources) {
+      if (source.episodes.length > latest) latest = source.episodes.length;
+    }
+    if (latest <= record.knownEpisodes) return;
+    final added = latest - record.knownEpisodes;
+    unawaited(repo
+        .applyFollowCheckResults([
+          record.copyWith(
+            knownEpisodes: latest,
+            lastCheckedAt: DateTime.now(),
+            lastUpdatedAt: DateTime.now(),
+          ),
+        ])
+        .then((_) {
+          if (!mounted) return;
+          showAppMessage('《${record.vodName}》已更新 $added 集',
+              type: AppMessageType.success);
+        })
+        .catchError((_) {}));
+  }
+
   /// 打开弹窗并**显式**指定当前集：`null` 即零高亮，不再回落推断。
   Future<void> _showDetailDialogWithCurrentEpisode(
       VodDetail detail, Site? site, CurrentEpisode? currentEpisode,
       {TmdbCardPreview? preview}) {
     final repo = ref.read(configRepositoryProvider);
+    _syncFollowFromDetail(detail, site);
     final prefs = ref.read(settingsRepositoryProvider).appearancePreferences.tmdb;
     final cinematic = prefs.cinematic &&
         detail.sources.any((s) => s.episodes.isNotEmpty) &&
@@ -6147,6 +6310,23 @@ class _DesktopMainViewState extends ConsumerState<DesktopMainView> {
           unawaited(_handleSearch(title, forceAggregate: true));
         } : null,
         onOpenUrl: ref.read(installerLauncherProvider).openUrl,
+        isFollowed: repo.isFollowing(site?.key, detail.item.id),
+        onToggleFollow: () async {
+          try {
+            var latest = 0;
+            for (final source in detail.sources) {
+              if (source.episodes.length > latest) {
+                latest = source.episodes.length;
+              }
+            }
+            await repo.toggleFollow(detail.item, totalEpisodes: latest);
+            return null;
+          } on DataRestorePendingRestartException catch (error) {
+            return error.message;
+          } catch (_) {
+            return '追剧状态保存失败，请稍后重试';
+          }
+        },
         onToggleFavorite: () async {
           try {
             await repo.toggleFavorite(detail.item);
@@ -6209,6 +6389,141 @@ class _DesktopMainViewState extends ConsumerState<DesktopMainView> {
     } catch (_) {
       return (value: null, cancelled: false);
     }
+  }
+
+  /// 原站源失效时的跨源续播：按片名在全部站源里聚合搜索，命中后拉详情、
+  /// 定位同一集并直接起播（进度接续由 `_startEpisodePlayback` 内的
+  /// `findLatestResumeCandidate` 按「归一化片名 + 集号」自动带入）。
+  ///
+  /// 返回 true = 已成功起播（并提示用户）；false = 没找到可用候选（调用方
+  /// 继续走原有报错 / 直链兜底路径）。
+  Future<bool> _tryCrossSourceResume(HistoryRecord record) async {
+    final query = record.vodName.trim();
+    if (query.isEmpty || !mounted) return false;
+    final repo = ref.read(configRepositoryProvider);
+    final sites = repo.currentVodConfig.sites;
+    final searchEngine = ref.read(searchEngineProvider);
+    if (sites.isEmpty) return false;
+
+    // 聚合搜索全部站源（复用搜索页同一条链路）；25s 整体兜底，
+    // 超时保留已收到的部分结果——有命中就足够定位跨源候选。
+    final results = <VodItem>[];
+    final seen = <String>{};
+    final cancelToken = SearchCancelToken();
+    showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            CircularProgressIndicator(color: context.palette.accentInk),
+            const SizedBox(height: 12),
+            Text('原站源失效，正在跨源查找「${record.vodName}」…',
+                style: TextStyle(color: context.palette.textSub)),
+          ],
+        ),
+      ),
+    );
+    try {
+      Future<void> collect() async {
+        await for (final batch in searchEngine.searchAllIncremental(
+            sites, query, cancelToken: cancelToken)) {
+          appendUniqueSearchItems(results, seen, batch.items);
+        }
+      }
+
+      await collect().timeout(const Duration(seconds: 25));
+    } catch (_) {
+      // 超时 / 个别站源异常：用已收到的部分结果继续。
+    } finally {
+      // 结果已经够用（或已放弃）：立刻叫停在途站源请求，否则几十个请求
+      // 还会继续打日志、占带宽（见 SearchCancelToken 文件头）。
+      cancelToken.cancel();
+      if (mounted) Navigator.of(context).pop();
+    }
+    if (!mounted) return false;
+
+    // 按归一化片名找到目标组，主条目 + 备用条目依次尝试拉详情、定位同集。
+    final key = normalizeVodName(record.vodName);
+    VodSearchGroup? group;
+    for (final g in groupSearchResults(results)) {
+      if (g.normalizedName == key) {
+        group = g;
+        break;
+      }
+    }
+    if (group == null) return false;
+
+    var attempts = 0;
+    for (final item in [group.main, ...group.alternates]) {
+      if (attempts >= 4 || !mounted) return false;
+      final site = _siteForCrossSource(item.siteKey);
+      if (site == null) continue;
+      attempts++;
+      final detail = await ref
+          .read(siteApiProvider)
+          .fetchDetail(site, vodId: item.id)
+          .then<VodDetail?>((v) => v)
+          .timeout(const Duration(seconds: 10), onTimeout: () => null)
+          .catchError((_) => null);
+      if (detail == null || detail.sources.isEmpty) continue;
+      final selection = _locateCrossSourceSelection(detail, record);
+      if (selection == null) continue;
+      _playbackOriginDetail = detail;
+      _playbackOriginSite = site;
+      await startEpisodePlaybackWithIntent(
+        ref,
+        detail.item,
+        selection,
+        targetSite: site,
+      );
+      if (mounted) {
+        showAppMessage('原站源失效，已自动切换到「${site.name}」续播',
+            type: AppMessageType.success);
+      }
+      return true;
+    }
+    return false;
+  }
+
+  Site? _siteForCrossSource(String? siteKey) {
+    if (siteKey == null || siteKey.isEmpty) return null;
+    for (final s in ref.read(configRepositoryProvider).currentVodConfig.sites) {
+      if (s.key == siteKey) return s;
+    }
+    return null;
+  }
+
+  /// 在跨源详情里定位「与历史记录同一集」的选集：
+  /// 集名全等 → 集号相等 → 单集影片兜底（电影各站集名差异大）。
+  EpisodeSelection? _locateCrossSourceSelection(
+      VodDetail detail, HistoryRecord record) {
+    final targetNumber = historyEpisodeNumberOf(record.episodeName);
+    final recordIsMovie = isMovieEpisodeName(record.episodeName);
+    for (final source in detail.sources) {
+      final episodes = source.episodes;
+      if (episodes.isEmpty) continue;
+      var index = episodes.indexWhere((e) => e.name == record.episodeName);
+      if (index < 0 && targetNumber != null) {
+        index = episodes.indexWhere(
+            (e) => historyEpisodeNumberOf(e.name) == targetNumber);
+      }
+      if (index < 0 && (recordIsMovie || episodes.length == 1)) {
+        // 电影 / 单集片：集名差异大，直接取唯一一集。
+        index = 0;
+      }
+      if (index < 0) continue;
+      return EpisodeSelection(
+        episode: episodes[index],
+        sourceName: source.name,
+        episodes: episodes,
+        index: index,
+        sources: detail.sources,
+        sourceIndex: detail.sources.indexOf(source),
+      );
+    }
+    return null;
   }
 
   /// 历史续播用：在详情里定位「记录里的那一条线路 + 那一集」。
@@ -6305,12 +6620,13 @@ class _DesktopMainViewState extends ConsumerState<DesktopMainView> {
         if (resolved.url.isNotEmpty) {
           resolvedSpec = resolved;
         }
-      } catch (e) {
+      } catch (error) {
         if (site?.usesCompanion ?? false) {
-          if (mounted) {
-            showAppMessage(playResolveFailureText(e),
-                type: AppMessageType.error);
-          }
+          // Spider 站解析失败：直链兜底没有意义，直接试跨源。
+          if (await _tryCrossSourceResume(record)) return;
+          if (!mounted) return;
+          showAppMessage('播放解析失败：${describePlaybackFailure(error)}',
+              type: AppMessageType.error);
           return;
         }
       }
@@ -6560,6 +6876,28 @@ class _DesktopMainViewState extends ConsumerState<DesktopMainView> {
             return '收藏保存失败，请稍后重试';
           }
         },
+        // 追剧分栏：点条目构造 VodItem 走既有的详情打开链路
+        // （详情请求按 siteKey 定位站源，与聚合搜索条目同一机制）。
+        follows: repo.follows,
+        onFollowTap: (record) {
+          _onItemClicked(VodItem(
+            id: record.vodId,
+            name: record.vodName,
+            pic: record.vodPic,
+            siteKey: record.siteKey,
+            siteName: record.siteName,
+          ));
+        },
+        onRemoveFollow: (id) async {
+          try {
+            await repo.removeFollow(id);
+            return null;
+          } on DataRestorePendingRestartException catch (error) {
+            return error.message;
+          } catch (_) {
+            return '追剧状态保存失败，请稍后重试';
+          }
+        },
       ),
     );
   }
@@ -6619,6 +6957,28 @@ class _DesktopMainViewState extends ConsumerState<DesktopMainView> {
     // 起播时才建网盘代理自恢复：此前没有播放器实例，首页路径也不注入引擎。
     ref.listen<MediaPlaySpec?>(activePlaySpecProvider, (_, next) {
       if (next != null) _ensureProxyRecovery();
+    });
+    // DLNA 投屏：换集 / 换线拿到新地址时自动重推到当前电视；退出播放断开会话。
+    // 只在地址变化时动作，避免历史/进度刷新等 spec 重建造成重复推送。
+    ref.listen<MediaPlaySpec?>(activePlaySpecProvider, (previous, next) {
+      if (previous?.url == next?.url) return;
+      final cast = ref.read(dlnaCastControllerProvider);
+      final current = cast.state.value;
+      if (!current.connected) return;
+      if (next == null || next.url.trim().isEmpty) {
+        cast.disconnect();
+        return;
+      }
+      final device = current.device!;
+      final spec = next;
+      unawaited(() async {
+        try {
+          await cast.cast(device, spec.url, title: spec.title);
+        } catch (_) {
+          // 设备离线 / 地址不可达：主动清会话，避免后续每集继续重试。
+          cast.disconnect();
+        }
+      }());
     });
 
     final config = ref.watch(vodConfigProvider);

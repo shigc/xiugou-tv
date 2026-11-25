@@ -59,6 +59,16 @@ class HistoryRecord {
   Duration? get resumePosition =>
       hasResumePosition && !isFinished ? Duration(milliseconds: positionMs) : null;
 
+  /// 是否还有一条**可直接播放**的路径：记录的直链兜底存在，或选集地址本身
+  /// 就是绝对地址（站源已删时仍能直连）。
+  ///
+  /// 为 false 时唯一出路是跨源找同名影片；为 true 时应当先试直链，
+  /// 不能拿几十个站源的聚合搜索去换一次本地就能发起的播放。
+  bool get hasDirectPlayablePath =>
+      playUrl.isNotEmpty ||
+      (episodeUrl.isNotEmpty &&
+          (Uri.tryParse(episodeUrl)?.hasScheme ?? false));
+
   HistoryRecord copyWith({
     String? id,
     String? vodId,

@@ -423,6 +423,7 @@ class _MessageActionButtonState extends State<_MessageActionButton> {
       onTap: widget.onTap,
       borderRadius: const BorderRadius.all(Radius.circular(AppRadii.sm)),
       child: MouseRegion(
+        cursor: SystemMouseCursors.click,
         onEnter: (_) => setState(() => _hovered = true),
         onExit: (_) => setState(() => _hovered = false),
         child: GestureDetector(

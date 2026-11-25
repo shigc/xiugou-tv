@@ -12,9 +12,10 @@ import 'models/player_shortcut_bindings.dart';
 import 'models/search_preferences.dart';
 import 'models/self_check_preferences.dart';
 import 'models/startup_preferences.dart';
+import 'models/video_cache_preferences.dart';
 import 'settings_storage.dart';
 
-enum SettingsSaveTarget { player, sources, startup, search, history, selfCheck, playSkip, appearance, network }
+enum SettingsSaveTarget { player, sources, startup, search, history, selfCheck, playSkip, appearance, network, videoCache }
 
 /// 磁盘保存状态，与内存值及播放器参数应用结果相互独立。
 class SettingsSaveState {
@@ -53,6 +54,9 @@ class SettingsRepository {
   NetworkPreferences _networkPreferences = const NetworkPreferences();
   bool _networkReadFailed = false;
   Future<void> _networkSaveChain = Future.value();
+  VideoCachePreferences _videoCachePreferences = const VideoCachePreferences();
+  bool _videoCacheReadFailed = false;
+  Future<void> _videoCacheSaveChain = Future.value();
 
   final _playerSettingsController = StreamController<PlayerSettings>.broadcast();
   final _configSourcesController = StreamController<List<ConfigSourceEntry>>.broadcast();
@@ -63,6 +67,7 @@ class SettingsRepository {
   final _playSkipPreferencesController = StreamController<PlaySkipPreferences>.broadcast();
   final _appearancePreferencesController = StreamController<AppearancePreferences>.broadcast();
   final _networkPreferencesController = StreamController<NetworkPreferences>.broadcast();
+  final _videoCachePreferencesController = StreamController<VideoCachePreferences>.broadcast();
 
   final _saveStateController = StreamController<SettingsSaveState>.broadcast();
   final _failedSaves = <SettingsSaveTarget>{};
@@ -331,6 +336,17 @@ class SettingsRepository {
       _networkReadFailed = true;
     }
     _networkPreferencesController.add(_networkPreferences);
+
+    try {
+      _videoCachePreferences =
+          await _storage.readVideoCachePreferences() ?? const VideoCachePreferences();
+      _videoCacheReadFailed = false;
+    } catch (_) {
+      // 结构损坏：保留原文件，按默认（开启 / 默认目录 / 20GB）运行，等待修复后重新读取
+      _videoCachePreferences = const VideoCachePreferences();
+      _videoCacheReadFailed = true;
+    }
+    _videoCachePreferencesController.add(_videoCachePreferences);
   }
 
   List<ConfigSourceEntry> _dedupe(List<ConfigSourceEntry> entries) {
@@ -773,6 +789,53 @@ class SettingsRepository {
     return next;
   }
 
+  /// 视频本地缓存偏好（只读快照）+ 变更流（main.dart 据此下发到引擎）。
+  VideoCachePreferences get videoCachePreferences => _videoCachePreferences;
+
+  Stream<VideoCachePreferences> get videoCachePreferencesStream async* {
+    yield _videoCachePreferences;
+    yield* _videoCachePreferencesController.stream;
+  }
+
+  /// 视频缓存偏好读取失败（原文件保留，修复后调用 [reloadVideoCachePreferences]）。
+  bool get videoCacheReadFailed => _videoCacheReadFailed;
+
+  /// 更新视频本地缓存偏好（整体快照替换，随后串行落盘）。
+  ///
+  /// 生效由 main.dart 订阅 [videoCachePreferencesStream] 完成（引擎不知道偏好来源）。
+  Future<void> updateVideoCachePreferences(VideoCachePreferences preferences) async {
+    if (_videoCacheReadFailed) {
+      throw StateError('视频缓存偏好读取失败，请先修复文件并重新读取');
+    }
+    if (preferences == _videoCachePreferences) return;
+    _videoCachePreferences = preferences;
+    _videoCachePreferencesController.add(preferences);
+    await _persistVideoCachePreferences();
+  }
+
+  /// 重新读取视频缓存偏好（读取失败修复后的恢复入口）。
+  Future<void> reloadVideoCachePreferences() async {
+    if (_failedSaves.contains(SettingsSaveTarget.videoCache)) {
+      throw StateError('请先重试保存视频缓存偏好，避免丢失本次修改');
+    }
+    try {
+      _videoCachePreferences =
+          await _storage.readVideoCachePreferences() ?? const VideoCachePreferences();
+      _videoCacheReadFailed = false;
+    } catch (_) {
+      _videoCacheReadFailed = true;
+    }
+    _videoCachePreferencesController.add(_videoCachePreferences);
+  }
+
+  Future<void> _persistVideoCachePreferences() {
+    final snapshot = _videoCachePreferences;
+    final next = _enqueueSave(SettingsSaveTarget.videoCache, _videoCacheSaveChain,
+        () => _storage.saveVideoCachePreferences(snapshot));
+    _videoCacheSaveChain = next;
+    return next;
+  }
+
   /// 订阅配置仓库的成功加载事件并记入历史；返回的订阅由调用方负责取消
   StreamSubscription<ConfigLoadEvent> bindConfigRepository(ConfigRepository repository) {
     return repository.configLoadedStream.listen((event) {
@@ -792,6 +855,7 @@ class SettingsRepository {
       _playSkipSaveChain.catchError((_) {}),
       _appearanceSaveChain.catchError((_) {}),
       _networkSaveChain.catchError((_) {}),
+      _videoCacheSaveChain.catchError((_) {}),
     ]);
   }
 
@@ -807,10 +871,12 @@ class SettingsRepository {
       _playSkipSaveChain.catchError((_) {}),
       _appearanceSaveChain.catchError((_) {}),
       _networkSaveChain.catchError((_) {}),
+      _videoCacheSaveChain.catchError((_) {}),
     ]);
     await _playSkipPreferencesController.close();
     await _appearancePreferencesController.close();
     await _networkPreferencesController.close();
+    await _videoCachePreferencesController.close();
     await _saveStateController.close();
     await _playerSettingsController.close();
     await _configSourcesController.close();

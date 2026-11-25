@@ -18,10 +18,9 @@ ThemeData buildAppTheme({
   final scheme = ColorScheme(
     brightness: brightness,
     primary: palette.accent,
-    // 压品牌填充的墨色随明暗反转：深色主题是深底（#414A5B）配白字 8.92:1；
-    // 浅色主题是浅底（#D8E3F8）配深蓝灰 #2A3550 9.44:1。白字压 #D8E3F8 只有 1.2，不可用。
-    onPrimary:
-        brightness == Brightness.dark ? Colors.white : const Color(0xFF2A3550),
+    // 压品牌填充的墨色随明暗反转：深色主题是深底配白字；浅色主题取各预设的
+    // onAccent（深一档同色相，如经典蓝灰 #2A3550），避免白字压浅填充（#D8E3F8 仅 1.2:1）不可读。
+    onPrimary: brightness == Brightness.dark ? Colors.white : palette.onAccent,
     secondary: palette.accent,
     onSecondary:
         brightness == Brightness.dark ? Colors.white : const Color(0xFF2A3550),

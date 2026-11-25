@@ -4,6 +4,7 @@ import 'dart:convert';
 import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
 
+import '../diagnostics/app_logger.dart';
 import 'live_danmaku_models.dart';
 
 /// Owns one companion subscription independently of the player's media clock.
@@ -335,11 +336,13 @@ class LiveDanmakuClient extends ChangeNotifier {
       final response =
           await _request(url, 'POST', timeout: const Duration(seconds: 5));
       if (response.statusCode != 200 && response.statusCode != 404) {
-        debugPrint('Live danmaku cleanup will use the companion lease expiry.');
+        AppLogger.instance.warning(
+            'danmaku', '直播弹幕远端清理失败，改由 companion 租约到期回收');
       }
     } catch (_) {
       // invariant: the companion's 60-second lease bounds failed remote cleanup.
-      debugPrint('Live danmaku cleanup will use the companion lease expiry.');
+      AppLogger.instance.warning(
+          'danmaku', '直播弹幕远端清理异常，改由 companion 租约到期回收');
     } finally {
       _pendingStops--;
       _closeOwnedDioIfUnused();

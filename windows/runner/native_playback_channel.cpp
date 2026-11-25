@@ -253,10 +253,15 @@ struct Session {
 }  // namespace
 
 struct PlaybackChannel::State {
-  State(FlutterDesktopPluginRegistrarRef registrar, HWND runner_window) : runner(runner_window) {
+  State(FlutterDesktopPluginRegistrarRef registrar, flutter::FlutterEngine* engine, HWND runner_window)
+      : runner(runner_window) {
     if (registrar) {
       textures = FlutterDesktopRegistrarGetTextureRegistrar(registrar);
-      FlutterDesktopPluginRegistrarGetGraphicsAdapter(registrar, adapter.GetAddressOf());
+    }
+    // 新引擎 API：图形适配器从 engine 获取（旧的
+    // FlutterDesktopPluginRegistrarGetGraphicsAdapter 已移除）。
+    if (engine) {
+      engine->GetGraphicsAdapter(adapter.GetAddressOf());
     }
   }
 
@@ -359,8 +364,8 @@ struct PlaybackChannel::State {
 };
 
 PlaybackChannel::PlaybackChannel(flutter::BinaryMessenger* messenger, FlutterDesktopPluginRegistrarRef registrar,
-                                 HWND runner)
-    : state_(std::make_shared<State>(registrar, runner)),
+                                 flutter::FlutterEngine* engine, HWND runner)
+    : state_(std::make_shared<State>(registrar, engine, runner)),
       channel_(messenger, "xiugou/native_playback", &flutter::StandardMethodCodec::GetInstance()) {
   channel_.SetMethodCallHandler([weak = std::weak_ptr<State>(state_)](const auto& call, Result result) {
     if (const auto state = weak.lock()) state->Handle(call, std::move(result));

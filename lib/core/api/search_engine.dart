@@ -1,6 +1,6 @@
 import 'dart:async';
-import 'dart:developer' as developer;
 import '../config/models/vod_config.dart';
+import '../diagnostics/app_logger.dart';
 import 'models/vod_models.dart';
 import 'search_cancel_token.dart';
 import 'site_api.dart';
@@ -58,13 +58,16 @@ class SearchEngine {
   /// 个在跑，取消后队列里一个都不再启动（§18 回归修复）。
   static const int companionConcurrency = 6;
 
+  /// CMS 站源的最大并发数。
+  ///
+  /// 站源配得多时十几个很常见，一次性把请求全打出去 = 十几个并发 HTTP
+  /// 加同样多的 jsonDecode（还在主线程），连接池和 CPU 同时被打满，
+  /// 搜索页直接卡住。CMS 能被 Dio 真正中止，所以限流不影响「取消」的即时性。
+  static const int cmsConcurrency = 4;
+
   SearchEngine({SiteApi? siteApi}) : _siteApi = siteApi ?? SiteApi();
 
-  void _log(String message) {
-    developer.log(message, name: 'TVBox-Desktop::SearchEngine');
-    // ignore: avoid_print
-    print('[SearchEngine] $message');
-  }
+  void _log(String message) => AppLogger.instance.debug('search', message);
 
   /// 可检索站源：`searchable != 0` 且 api 非空（与 [searchAll] 同一判据）
   List<Site> _searchableSites(List<Site> sites) =>
@@ -109,9 +112,20 @@ class SearchEngine {
           _searchSiteOutcome(site, query, cancelToken: cancelToken);
     }
 
-    for (final site in immediate) {
-      start(site);
+    // CMS 也排队 + 限并发（与 Spider 同一套调度，只是上限不同）
+    var immediateActive = 0;
+    void pumpImmediate() {
+      while (immediateActive < cmsConcurrency &&
+          immediate.isNotEmpty &&
+          !(cancelToken?.isCancelled ?? false)) {
+        final site = immediate.removeAt(0);
+        immediateActive++;
+        start(site);
+        pending[site] = pending[site]!.whenComplete(() => immediateActive--);
+      }
     }
+
+    pumpImmediate();
 
     var companionActive = 0;
     void pumpCompanion() {
@@ -144,6 +158,7 @@ class SearchEngine {
         error: outcome.error,
       );
       pumpCompanion();
+      pumpImmediate();
     }
   }
 

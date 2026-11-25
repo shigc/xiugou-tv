@@ -6,6 +6,7 @@ import 'package:crypto/crypto.dart';
 import 'package:path/path.dart' as p;
 
 import '../config/windows_config_storage.dart';
+import '../diagnostics/app_logger.dart';
 import '../live/live_direct_mode_memory.dart';
 import '../live/live_source_history.dart';
 import '../player/models/player_settings.dart';
@@ -17,6 +18,8 @@ import '../settings/models/play_skip_preferences.dart';
 import '../settings/models/search_preferences.dart';
 import '../settings/models/self_check_preferences.dart';
 import '../settings/models/startup_preferences.dart';
+import '../settings/models/video_cache_preferences.dart';
+import '../update/update_preferences.dart';
 import 'app_data_files.dart';
 import 'models/data_backup.dart';
 
@@ -49,8 +52,9 @@ typedef BackupFileWriter = Future<void> Function(String path, String content);
 
 /// 数据备份与恢复服务（SET-10）。
 ///
-/// 格式：单文件 JSON 信封 v1，只存 13 个备份白名单文件的原文 + UTF-8 字节数
-/// + SHA-256；不含窗口状态、JRE/JAR、缓存、日志或备份自身。
+/// 格式：单文件 JSON 信封 v1，只存备份白名单（见 `app_data_files.dart` 的
+/// [backupAppDataFiles]）里那些文件的原文 + UTF-8 字节数 + SHA-256；
+/// 不含窗口状态、外观偏好、可再生缓存、JRE/JAR、日志或备份自身。
 class DataBackupService {
   static const int maxTotalBytes = 20 * 1024 * 1024;
   static const int maxEntryBytes = 10 * 1024 * 1024;
@@ -88,7 +92,7 @@ class DataBackupService {
         _flushTimeout = flushTimeout;
 
 
-  /// 读取当前 13 个数据文件并生成备份对象；不写盘。
+  /// 读取白名单内的数据文件并生成备份对象；不写盘。
   ///
   /// [allowInvalid] 为 true 时用于「恢复前自动备份」：即使当前数据为空 /
   /// 结构损坏 / 单文件不可读，也尽量保留原文，避免因坏数据而无法恢复。
@@ -174,6 +178,8 @@ class DataBackupService {
       throw const DataBackupException('备份保存目录不存在');
     }
     await _write(target, backup.encode());
+    AppLogger.instance.info(
+        'backup', '备份已导出：${backup.files.length} 个文件 -> ${p.basename(target)}');
   }
 
   /// 读取并校验备份文件；任一条目不合格整份拒绝。
@@ -257,6 +263,8 @@ class DataBackupService {
         await _write(target, entry.content);
         applied.add(entry.name);
       } catch (error) {
+        AppLogger.instance.error('backup',
+            '恢复失败：${entry.name} 写入失败', error: error);
         final rollbackFailures = await _rollback(applied, preRestore);
         final detail = rollbackFailures.isEmpty
             ? '已自动回滚到恢复前状态'
@@ -269,6 +277,7 @@ class DataBackupService {
     }
 
     await _prunePreRestoreBackups();
+    AppLogger.instance.info('backup', '备份已恢复：${applied.length} 个文件');
     final skipped = preRestore.existedNames
         .difference(preRestore.backup.files.keys.toSet())
         .toList()
@@ -442,6 +451,10 @@ class DataBackupService {
         case 'favorites.json':
           _validateList(content, name, maxItems: 5000);
           break;
+        case 'follows.json':
+          // 追剧记录：条数少、单条小，上限对齐收藏量级即可。
+          _validateList(content, name, maxItems: 2000);
+          break;
         case 'live_favorites.json':
           // 直播频道没有海报，单条体积小；上限对齐收藏量级即可。
           _validateList(content, name, maxItems: 2000);
@@ -485,6 +498,10 @@ class DataBackupService {
               throw const FormatException('配置源历史条目过多');
             }
           }
+          break;
+        case 'site_subscriptions.json':
+          // 配置订阅列表：与配置源同量级；条目含订阅地址，注册表已标 sensitive。
+          _validateList(content, name, maxItems: 500);
           break;
         case 'current_config.json':
           final map = _map(content, name);
@@ -540,6 +557,12 @@ class DataBackupService {
           break;
         case 'startup_preferences.json':
           StartupPreferences.fromJson(_map(content, name));
+          break;
+        case 'video_cache_preferences.json':
+          VideoCachePreferences.fromJson(_map(content, name));
+          break;
+        case 'update_preferences.json':
+          UpdatePreferences.fromJson(_map(content, name));
           break;
         default:
           throw FormatException('不允许的备份文件：$name');

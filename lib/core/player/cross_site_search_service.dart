@@ -1,11 +1,11 @@
 import 'dart:async';
-import 'dart:developer' as developer;
 
 import '../api/models/vod_models.dart';
 import '../api/search_cancel_token.dart';
 import '../api/search_engine.dart';
 import '../api/site_api.dart';
 import '../config/models/vod_config.dart';
+import '../diagnostics/app_logger.dart';
 import 'cross_site_failover_planner.dart';
 
 /// Matches [SearchEngine.searchAllIncremental], including request cancellation.
@@ -362,12 +362,8 @@ Future<void> _cancelSubscription(
 }
 
 void _reportCleanupError(Object error, StackTrace stack) {
-  developer.log(
-    'Cross-site search cleanup failed',
-    name: 'CrossSiteSearchService',
-    error: error,
-    stackTrace: stack,
-  );
+  AppLogger.instance.error('cross-site',
+      '跨站搜索订阅清理失败', error: error, stack: stack);
 }
 
 class _SearchHit {

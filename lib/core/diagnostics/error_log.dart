@@ -1,5 +1,8 @@
 import 'package:flutter/foundation.dart';
 
+import 'app_logger.dart';
+import 'log_redaction.dart';
+
 /// 错误日志（设置 → 关于 → 「错误日志」：点击在应用内查看，长按清除）。
 ///
 /// 2026-10-27 用户口径：**只记录本次打开期间**的错误，软件关闭即清空——
@@ -40,7 +43,8 @@ class ErrorLog extends ChangeNotifier {
   List<ErrorLogEntry> get entries => List.unmodifiable(_entries);
   bool get isEmpty => _entries.isEmpty;
 
-  void record(String source, Object error, [StackTrace? stack]) {
+  void record(String source, Object error,
+      [StackTrace? stack, AppLogLevel level = AppLogLevel.error]) {
     String? stackText;
     if (stack != null) {
       final lines = '$stack'.trimRight().split('\n').where((l) => l.trim().isNotEmpty).toList();
@@ -52,6 +56,11 @@ class ErrorLog extends ChangeNotifier {
     _entries.add(ErrorLogEntry(time: _now(), source: source, message: redact('$error').trim(), stack: stackText));
     if (_entries.length > maxEntries) _entries.removeRange(0, _entries.length - maxEntries);
     notifyListeners();
+
+    // 错误同时进入统一分级日志（文件落盘），这样「关于 → 错误日志」只保留
+    // 本次运行的内存视图，而设置页「日志」与 app.log 也能看到同一批错误。
+    AppLogger.instance.log(level, source, _entries.last.message,
+        error: error, stack: stack);
   }
 
   void clear() {
@@ -64,11 +73,7 @@ class ErrorLog extends ChangeNotifier {
   String get text => _entries.map((e) => e.toString()).join('\n\n');
 
   /// 抹掉 URL 查询串与常见凭据字段，避免令牌进日志。
-  static String redact(String text) => text
-      .replaceAllMapped(RegExp(r'(https?://[^\s?#"]+)\?[^\s"]*'), (m) => '${m[1]}?…')
-      .replaceAllMapped(
-          // Authorization: Bearer xxx —— 认证方案后面的值一起抹掉
-          RegExp(r'((?:token|authorization|cookie|password|passwd|secret)\s*[=:]\s*)(?:(?:bearer|basic)\s+)?[^\s,;&]+',
-              caseSensitive: false),
-          (m) => '${m[1]}…');
+  ///
+  /// 规则统一放在 [redactLogText]，AppLogger / CompanionLog 共用（保留本入口兼容旧调用）。
+  static String redact(String text) => redactLogText(text);
 }

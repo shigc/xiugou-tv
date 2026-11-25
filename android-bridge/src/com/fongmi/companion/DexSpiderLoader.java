@@ -110,6 +110,9 @@ public class DexSpiderLoader {
             cacheDir.mkdirs();
         }
         purgeObsoleteArtifacts(cacheDir);
+        // 上次会话被强杀时转换工作目录可能来不及清理，启动时直接扫一次，
+        // 避免本次又新建一个工作目录、把十几秒的 dex2jar 白做在残留文件旁边。
+        sweepStaleWork();
         this.rules = SourceRules.load(cacheDir.getParentFile());
         System.out.println("[DexSpiderLoader] " + rules);
         registerBuiltinFactories();
@@ -1158,8 +1161,7 @@ public class DexSpiderLoader {
                 return jarFile; // 标准 JVM jar 或非 dex 容器，直接使用
             }
 
-            if (jvmJar.exists() && jvmJar.length() > 0
-                    && jvmJar.lastModified() >= jarFile.lastModified()) {
+            if (jvmJar.exists() && jvmJar.length() > 0 && jvmJarCacheMatches(jvmJar, jarFile)) {
                 return jvmJar;
             }
 
@@ -1195,6 +1197,7 @@ public class DexSpiderLoader {
                 tmp.delete();
                 converted.setLastModified(System.currentTimeMillis());
                 publish(converted, jvmJar);
+                writeJvmJarStamp(jvmJar, jarFile);
                 reportDegradedMethods(jvmJar);
                 System.out.println("[DexSpiderLoader] Dex2jar done in " + (System.currentTimeMillis() - t0)
                         + "ms -> " + jvmJar.getName() + " (" + jvmJar.length() + " bytes, "
@@ -1214,6 +1217,38 @@ public class DexSpiderLoader {
             return null;
         } finally {
             deleteWork(work);
+        }
+    }
+
+    /** 转换产物旁边的人读摘要文件；有它就按内容判定缓存，不再受 mtime 抖动影响。 */
+    private static File stampFile(File jvmJar) {
+        return new File(jvmJar.getAbsolutePath() + ".md5");
+    }
+
+    /**
+     * 缓存命中优先看 sidecar 里记录的源内容摘要：重下载、杀软扫描都会刷新源 jar 的
+     * mtime，但字节没变就不该重做十几秒的 dex2jar。旧产物没有 sidecar 时回退 mtime。
+     */
+    private boolean jvmJarCacheMatches(File jvmJar, File jarFile) {
+        File stamp = stampFile(jvmJar);
+        if (stamp.isFile()) {
+            try {
+                String recorded = new String(java.nio.file.Files.readAllBytes(stamp.toPath()),
+                        java.nio.charset.StandardCharsets.US_ASCII).trim();
+                if (!recorded.isEmpty()) return recorded.equalsIgnoreCase(md5File(jarFile));
+            } catch (Throwable ignored) {
+                // sidecar 损坏 / 读失败：退回 mtime，绝不因为缓存元数据让站点加载失败。
+            }
+        }
+        return jvmJar.lastModified() >= jarFile.lastModified();
+    }
+
+    private static void writeJvmJarStamp(File jvmJar, File jarFile) {
+        try {
+            java.nio.file.Files.write(stampFile(jvmJar).toPath(),
+                    md5File(jarFile).getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+        } catch (Throwable ignored) {
+            // 写失败不影响产物发布，下次按 mtime 回退。
         }
     }
 
@@ -1262,11 +1297,23 @@ public class DexSpiderLoader {
         return -1;
     }
 
+    /**
+     * 订阅清单里的 md5 常被写成 {@code ?hash?} / {@code "hash"} / {@code [hash]}，
+     * 直接用原串比较会让同一份缓存永远判为不符，每次启动都重新下载并刷新 mtime，
+     * 进而把 dex2jar 产物一起作废（实测一次十几秒）。这里抽取前 32 位十六进制作为身份。
+     */
+    private static String normalizeMd5(String raw) {
+        if (raw == null) return "";
+        String hex = raw.trim().replaceAll("[^0-9a-fA-F]", "");
+        if (hex.length() < 32) return "";
+        return hex.substring(0, 32).toLowerCase(Locale.ROOT);
+    }
+
     private File resolveJarFile(String jarSpec) {
         try {
             String[] parts = jarSpec.split(";md5;");
             String rawUrl = parts[0].trim();
-            String expectedMd5 = parts.length > 1 ? parts[1].trim() : "";
+            String expectedMd5 = parts.length > 1 ? normalizeMd5(parts[1]) : "";
 
             if (rawUrl.regionMatches(true, 0, "file:", 0, 5) || rawUrl.startsWith("/") || (rawUrl.length() > 2 && rawUrl.charAt(1) == ':')) {
                 File file = rawUrl.regionMatches(true, 0, "file:", 0, 5) ? new File(URI.create(rawUrl)) : new File(rawUrl);
@@ -1437,7 +1484,10 @@ public class DexSpiderLoader {
             boolean ours = name.startsWith(WORK_PREFIX);
             boolean legacy = (name.contains("-jvm7") || name.contains("-jvm8") || name.contains("-jvm9") || name.contains("-jvm10"))
                     && (name.endsWith(".tmp.jar") || name.endsWith(".tmp"));
-            if (!ours && !legacy) continue;
+            // java.util.zip 的 ZipFileSystem 在进程被强杀时会留下 zipfstmp*.tmp，
+            // 之前无人清理；这些通常 1~2 MB 一个，统一按 10 分钟阈值回收。
+            boolean zipTmp = name.startsWith("zipfstmp") && name.endsWith(".tmp");
+            if (!ours && !legacy && !zipTmp) continue;
             try {
                 java.nio.file.attribute.BasicFileAttributes attrs = Files.readAttributes(entry.toPath(),
                         java.nio.file.attribute.BasicFileAttributes.class, java.nio.file.LinkOption.NOFOLLOW_LINKS);

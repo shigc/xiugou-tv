@@ -12,13 +12,14 @@ import 'player_source_switch_actions.dart';
 
 /// 播放失败面板（④ 直播播放报错诊断闭环）。
 ///
-/// 默认只显示友好文案与两个动作；「详情」渐进披露原始错误 / 脱敏地址 /
-/// 请求头概览 / 引擎日志（最近 40 条），「复制诊断」把脱敏后的诊断文本
-/// 写入剪贴板并给出反馈。
+/// 默认只显示友好文案与几个动作：「重试」按原始参数重新起播，「详情」渐进
+/// 披露原始错误 / 脱敏地址 / 请求头概览 / 引擎日志（最近 40 条），「复制诊断」
+/// 把脱敏后的诊断文本写入剪贴板并给出反馈；右上角「关闭」可临时收起面板
+///（同一个错误只收起一次，换了个错误会重新弹出）。
 ///
 /// skill 命中（ui-ux-pro-max，`--domain ux`）：
 /// - Error Messages：错误需被宣告（本面板挂 `liveRegion`）；
-/// - Error Recovery：错误必须给恢复路径（文案 + 复制诊断提供可行动的下一步）；
+/// - Error Recovery：错误必须给恢复路径（重试 + 文案 + 复制诊断提供可行动的下一步）；
 /// - progressive disclosure：复杂信息渐进披露，不一次压给用户。
 /// Flutter 栈检索无对口条目（仅命中通用布局规则），实现沿用本仓令牌与
 /// FocusOutline 约定。
@@ -31,6 +32,14 @@ class PlaybackErrorPanel extends StatefulWidget {
   final VoidCallback? onOpenChannelList;
   final VoidCallback? onOpenEpisodeList;
 
+  /// 「重试」回调；为 null 时不显示重试按钮。
+  final VoidCallback? onRetry;
+
+  /// 「换线路」回调；为 null（只有一条线路，或其余线路都试过并失败了）时不显示。
+  ///
+  /// 没有它，用户在失败面板上唯一能做的就是对着同一条已失败的链路反复重试。
+  final VoidCallback? onSwitchLine;
+
   const PlaybackErrorPanel({
     super.key,
     required this.rawError,
@@ -40,6 +49,8 @@ class PlaybackErrorPanel extends StatefulWidget {
     this.externalNav,
     this.onOpenChannelList,
     this.onOpenEpisodeList,
+    this.onRetry,
+    this.onSwitchLine,
   });
 
   @override
@@ -48,6 +59,7 @@ class PlaybackErrorPanel extends StatefulWidget {
 
 class _PlaybackErrorPanelState extends State<PlaybackErrorPanel> {
   bool _expanded = false;
+  bool _dismissed = false;
 
   void _toggleExpanded() => setState(() => _expanded = !_expanded);
 
@@ -58,6 +70,17 @@ class _PlaybackErrorPanelState extends State<PlaybackErrorPanel> {
     final nav = widget.externalNav;
     if (!_hasExternalPlayer || nav == null || !nav.enabled || nav.busy) return;
     nav.onLaunch();
+  }
+
+  @override
+  void didUpdateWidget(PlaybackErrorPanel oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // 换了新错误（重新起播 / 自动重试后又失败）时恢复显示；
+    // 同一个错误保持用户关闭的状态，不再反复弹出。
+    if (widget.rawError != oldWidget.rawError) {
+      _dismissed = false;
+      _expanded = false;
+    }
   }
 
   Future<void> _copyDiagnostics() async {
@@ -76,6 +99,7 @@ class _PlaybackErrorPanelState extends State<PlaybackErrorPanel> {
     final palette = context.palette;
     final externalNav = _hasExternalPlayer ? widget.externalNav : null;
     final externalStatus = externalNav?.statusText?.trim();
+    if (_dismissed) return const SizedBox.shrink();
     return Semantics(
       container: true,
       liveRegion: true,
@@ -106,6 +130,12 @@ class _PlaybackErrorPanelState extends State<PlaybackErrorPanel> {
                         color: palette.playerText, fontSize: AppType.label),
                   ),
                 ),
+                // 关闭：仅收起面板（didUpdateWidget 里新错误会重新弹出）
+                _PanelIconButton(
+                  icon: Icons.close_rounded,
+                  tooltip: '关闭',
+                  onPressed: () => setState(() => _dismissed = true),
+                ),
               ],
             ),
             const SizedBox(height: AppSpacing.sm),
@@ -113,6 +143,18 @@ class _PlaybackErrorPanelState extends State<PlaybackErrorPanel> {
               spacing: AppSpacing.sm,
               runSpacing: AppSpacing.xs,
               children: [
+                if (widget.onRetry != null)
+                  _PanelTextButton(
+                    icon: Icons.refresh_rounded,
+                    label: '重试',
+                    onPressed: widget.onRetry!,
+                  ),
+                if (widget.onSwitchLine != null)
+                  _PanelTextButton(
+                    icon: Icons.swap_horiz_rounded,
+                    label: '换线路',
+                    onPressed: widget.onSwitchLine!,
+                  ),
                 if (widget.onOpenEpisodeList != null)
                   _PanelTextButton(
                     icon: Icons.video_library_rounded,
@@ -279,6 +321,40 @@ class _DetailRow extends StatelessWidget {
       .replaceAll('/', '/\u200B')
       .replaceAll('&', '&\u200B')
       .replaceAll('?', '?\u200B');
+}
+
+/// 面板右上角小圆按钮（关闭）。
+class _PanelIconButton extends StatelessWidget {
+  final IconData icon;
+  final String tooltip;
+  final VoidCallback onPressed;
+
+  const _PanelIconButton({
+    required this.icon,
+    required this.tooltip,
+    required this.onPressed,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final palette = context.palette;
+    return Tooltip(
+      message: tooltip,
+      child: FocusOutline(
+        radius: AppRadii.pill,
+        child: InkResponse(
+          onTap: onPressed,
+          radius: 16,
+          highlightColor: palette.playerText.withValues(alpha: 0.12),
+          child: Padding(
+            padding: const EdgeInsets.all(4),
+            child: Icon(icon,
+                size: 16, color: palette.playerText.withValues(alpha: 0.7)),
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 /// 面板内小按钮：与播放器设置面板同款紧凑样式 + 叠画焦点描边（focus-states）。

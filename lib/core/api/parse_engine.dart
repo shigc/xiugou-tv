@@ -17,8 +17,33 @@ class ParseEngine {
               ),
             );
 
-  /// 根据原始播放地址与平台旗标解析可直接播放的流媒体地址 (m3u8 / mp4)
-  Future<MediaPlaySpec> parse(String rawUrl, {String? flag, List<Parse> parses = const [], bool requireResolved = false}) async {
+  /// 单条解析接口的限时：健康的解析 1~2 秒返回，异常的要快速放行下一条，
+  /// 不能让一条死解析按默认超时（connect 10s + receive 12s）拖满 22 秒。
+  static const Duration _perRequestConnectTimeout = Duration(seconds: 6);
+  static const Duration _perRequestReceiveTimeout = Duration(seconds: 8);
+
+  /// 整轮解析的时间预算：预算耗尽即停止尝试剩余规则，回落直连播放。
+  static const Duration _totalBudget = Duration(seconds: 15);
+
+  /// 失败解析的熔断时长。同一配置里坏掉的解析接口在每条线路、每次切集时
+  /// 都会被重新撞一遍；熔断期内直接跳过，到期自然恢复。
+  static const Duration _breakerOpenFor = Duration(minutes: 10);
+
+  /// 熔断与预算计时统一走单调时钟：Windows 上 DateTime.now() 精度约 15ms
+  /// 且可能跳变，连读两次甚至可能倒序，不足以判定「1 秒内不该恢复」。
+  final Stopwatch _uptime = Stopwatch()..start();
+
+  /// 解析接口失败时刻表（进程内记忆）：key 为解析 URL，value 为失败时的单调毫秒。
+  final Map<String, int> _failedAt = {};
+
+  /// 根据原始播放地址与平台旗标解析可直接播放的流媒体地址 (m3u8 / mp4)。
+  ///
+  /// [breakerRetried] 内部防重入：全熔断补试只允许一轮。
+  Future<MediaPlaySpec> parse(String rawUrl,
+      {String? flag,
+      List<Parse> parses = const [],
+      bool requireResolved = false,
+      bool breakerRetried = false}) async {
     final trimmed = rawUrl.trim();
 
     // 1. 如果本身已是标准直链媒体文件，无需调用解析接口
@@ -27,40 +52,64 @@ class ParseEngine {
     }
 
     // 2. 遍历配置中的有效解析规则进行直链嗅探/接口解析
-    for (final parseItem in parses) {
+    final candidates = parses.where((p) => p.type == 1).toList();
+    final deadlineMs = _uptime.elapsedMilliseconds + _totalBudget.inMilliseconds;
+    var attempted = 0;
+    for (final parseItem in candidates) {
+      // 熔断期内的失败解析直接跳过：坏接口在每条线路、每次切集都会被重撞。
+      if (_isBreakerOpen(parseItem.url)) continue;
+      if (_uptime.elapsedMilliseconds >= deadlineMs) break;
+      attempted++;
       try {
-        if (parseItem.type == 1) {
-          // JSON 接口解析
-          final parseApi = parseItem.url;
-          final targetUrl = '$parseApi$trimmed';
+        // JSON 接口解析
+        final parseApi = parseItem.url;
+        final targetUrl = '$parseApi$trimmed';
 
-          final headers = <String, dynamic>{
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 xiugou-tv/5.6.3',
-          };
-          if (parseItem.header != null) {
-            headers.addAll(parseItem.header!);
-          }
-
-          final response = await _dio.get(
-            targetUrl,
-            options: Options(headers: headers, responseType: ResponseType.plain),
-          );
-
-          final result = _extractUrlFromJson(response.data);
-          if (result != null && result.isNotEmpty) {
-            return MediaPlaySpec(
-              url: result,
-              headers: parseItem.header,
-            );
-          }
+        final headers = <String, dynamic>{
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 xiugou-tv/5.6.3',
+        };
+        if (parseItem.header != null) {
+          headers.addAll(parseItem.header!);
         }
+
+        final response = await _dio.get(
+          targetUrl,
+          options: Options(
+            headers: headers,
+            responseType: ResponseType.plain,
+            connectTimeout: _perRequestConnectTimeout,
+            receiveTimeout: _perRequestReceiveTimeout,
+          ),
+        );
+
+        final result = _extractUrlFromJson(response.data);
+        if (result != null && result.isNotEmpty) {
+          _failedAt.remove(parseItem.url);
+          return MediaPlaySpec(
+            url: result,
+            headers: parseItem.header,
+          );
+        }
+        // 有响应但拿不到地址：同样计为失败（多半是接口已废弃）
+        _tripBreaker(parseItem.url);
       } catch (_) {
-        // 单个解析接口失败时轮询下一个备用解析
+        // 单个解析接口失败/超时：熔断并轮询下一个备用解析
+        _tripBreaker(parseItem.url);
         continue;
       }
     }
 
     if (requireResolved) {
+      // Spider 链路没有直连兜底：若全部候选都在熔断期（一次都没试），
+      // 清空熔断表完整重跑一轮——宁可慢一轮，也不能把可播内容锁死 10 分钟。
+      if (attempted == 0 && candidates.isNotEmpty && !breakerRetried) {
+        _failedAt.clear();
+        return parse(rawUrl,
+            flag: flag,
+            parses: parses,
+            requireResolved: true,
+            breakerRetried: true);
+      }
       throw const FormatException('没有可用的 JSON 解析结果，暂不支持网页嗅探');
     }
 
@@ -106,6 +155,19 @@ class ParseEngine {
     }
     return MediaPlaySpec(url: url, headers: headers.isEmpty ? null : headers);
   }
+
+  bool _isBreakerOpen(String url) {
+    final failedMs = _failedAt[url];
+    if (failedMs == null) return false;
+    if (_uptime.elapsedMilliseconds - failedMs >=
+        _breakerOpenFor.inMilliseconds) {
+      _failedAt.remove(url);
+      return false;
+    }
+    return true;
+  }
+
+  void _tripBreaker(String url) => _failedAt[url] = _uptime.elapsedMilliseconds;
 
   bool _isDirectMediaUrl(String url) {
     final lower = url.toLowerCase();

@@ -4,6 +4,9 @@ import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:package_info_plus/package_info_plus.dart';
+import 'package:path/path.dart' as p;
+import '../../../core/cache/video_cache_store.dart';
+import '../../../core/settings/models/video_cache_preferences.dart';
 import '../../../core/config/config_repository.dart';
 import '../../../core/config/config_source_switcher.dart';
 import 'package:dio/dio.dart' show DioException;
@@ -11,6 +14,7 @@ import '../../../core/companion/companion_process_manager.dart';
 import '../../../core/companion/companion_spider_api.dart';
 import '../../../core/config/models/vod_config.dart';
 import '../../../core/build_info.dart';
+import '../../../core/diagnostics/app_logger.dart';
 import '../../../core/diagnostics/error_log.dart';
 import '../../../core/danmaku/danmaku_api.dart';
 import '../../../core/danmaku/danmaku_settings.dart';
@@ -27,6 +31,7 @@ import '../widgets/app_message.dart';
 import '../widgets/app_motion.dart';
 import '../dialogs/app_dialog.dart';
 import '../widgets/focus_ring.dart';
+import 'log_panel.dart';
 import '../../theme/app_tokens.dart';
 import '../../../core/settings/models/play_skip_preferences.dart';
 import '../../../core/settings/wallpaper_store.dart';
@@ -67,6 +72,7 @@ enum SettingsSection {
   appearance,
   player,
   shortcuts,
+  log,
   about
 }
 
@@ -132,6 +138,9 @@ class SettingsPage extends StatefulWidget {
   /// 独立直播源（「直播源」分区）；缺省不显示该分区。
   final LiveRepository? liveRepository;
 
+  /// 统一分级日志（「日志」分区；缺省用全局单例）。
+  final AppLogger? appLogger;
+
   const SettingsPage({
     super.key,
     required this.configRepository,
@@ -156,6 +165,7 @@ class SettingsPage extends StatefulWidget {
     this.danmakuAvailable,
     this.companionSpiderApi,
     this.liveRepository,
+    this.appLogger,
   });
 
   @override
@@ -280,6 +290,10 @@ class _SettingsPageState extends State<SettingsPage> {
                                 key: const ValueKey('settings-shortcuts'),
                                 settingsRepository: widget.settingsRepository,
                               ),
+                            SettingsSection.log => LogPanel(
+                                key: const ValueKey('settings-log'),
+                                log: widget.appLogger ?? AppLogger.instance,
+                              ),
                             SettingsSection.about => AboutPanel(
                                 key: const ValueKey('settings-about'),
                                 playerEngine: widget.playerEngine,
@@ -380,6 +394,13 @@ class _SettingsPageState extends State<SettingsPage> {
                     label: '快捷键',
                     selected: _section == SettingsSection.shortcuts,
                     onTap: () => _selectSection(SettingsSection.shortcuts),
+                  ),
+                  const SizedBox(height: 8),
+                  _SectionTab(
+                    icon: Icons.article_outlined,
+                    label: '日志',
+                    selected: _section == SettingsSection.log,
+                    onTap: () => _selectSection(SettingsSection.log),
                   ),
                   const SizedBox(height: 8),
                   _SectionTab(
@@ -2506,6 +2527,63 @@ class _PlayerSettingsPanelState extends State<PlayerSettingsPanel> {
                 ],
               ),
             ),
+            const _GroupTitle('字幕'),
+            _card(
+              context,
+              child: Column(
+                children: [
+                  _SettingRow(
+                    title: '字幕同步偏置',
+                    description: '正值让字幕延后出现，负值让字幕提前；外挂字幕对不上时间时调这里',
+                    trailing: _SliderControl(
+                      key: const ValueKey('setting-subtitle-delay'),
+                      value: s.subtitleDelayMs.toDouble(),
+                      min: PlayerSettings.minSubtitleDelayMs.toDouble(),
+                      max: PlayerSettings.maxSubtitleDelayMs.toDouble(),
+                      divisions: (PlayerSettings.maxSubtitleDelayMs -
+                              PlayerSettings.minSubtitleDelayMs) ~/
+                          100,
+                      format: (v) =>
+                          '${v >= 0 ? '+' : ''}${(v / 1000).toStringAsFixed(1)} 秒',
+                      onCommit: (v) =>
+                          _update(s.copyWith(subtitleDelayMs: v.round())),
+                    ),
+                  ),
+                  const _RowDivider(),
+                  _SettingRow(
+                    title: '字幕字号',
+                    description: '1.0 为播放器默认大小；字幕压住画面或太小时可调整',
+                    trailing: _SliderControl(
+                      key: const ValueKey('setting-subtitle-scale'),
+                      value: s.subtitleScale,
+                      min: PlayerSettings.minSubtitleScale,
+                      max: PlayerSettings.maxSubtitleScale,
+                      divisions: ((PlayerSettings.maxSubtitleScale -
+                                  PlayerSettings.minSubtitleScale) *
+                          10)
+                          .round(),
+                      format: (v) => '${v.toStringAsFixed(1)} 倍',
+                      onCommit: (v) => _update(s.copyWith(subtitleScale: v)),
+                    ),
+                  ),
+                  const _RowDivider(),
+                  _SettingRow(
+                    title: '字幕位置',
+                    description: '默认贴在画面底部；数值越小越往上，可避开硬字幕或任务条',
+                    trailing: _SliderControl(
+                      key: const ValueKey('setting-subtitle-position'),
+                      value: s.subtitlePosition.toDouble(),
+                      min: PlayerSettings.minSubtitlePosition.toDouble(),
+                      max: PlayerSettings.maxSubtitlePosition.toDouble(),
+                      divisions: 20,
+                      format: (v) => '${v.round()}%',
+                      onCommit: (v) =>
+                          _update(s.copyWith(subtitlePosition: v.round())),
+                    ),
+                  ),
+                ],
+              ),
+            ),
             const _GroupTitle('播放页'),
             _card(
               context,
@@ -2737,7 +2815,294 @@ class _PlayerSettingsPanelState extends State<PlayerSettingsPanel> {
                 ],
               ),
             ),
+            const SizedBox(height: 16),
+            const _GroupTitle('画质增强（超分辨率）'),
+            _card(
+              context,
+              child: Column(
+                children: [
+                  _SettingRow(
+                    title: '启用画质增强',
+                    description: '开启后把内置的 Anime4K 风格着色器注入播放引擎，'
+                        '实时锐化动画线条、提升清晰度；关闭即恢复原始画面',
+                    trailing: Switch(
+                      key: const ValueKey('setting-super-resolution-enabled'),
+                      value: s.superResolutionEnabled,
+                      onChanged: (value) =>
+                          _update(s.copyWith(superResolutionEnabled: value)),
+                    ),
+                  ),
+                  const _RowDivider(),
+                  _SettingRow(
+                    title: '增强强度',
+                    description: '「画质」锐化更充分，「轻量」性能开销更小；'
+                        '强度切换与开关均在播放中即时生效',
+                    trailing: _OptionDropdown(
+                      key: const ValueKey('setting-super-resolution-strength'),
+                      options: PlayerSettings.superResolutionStrengthOptions,
+                      value: s.superResolutionStrength,
+                      enabled: s.superResolutionEnabled,
+                      onChanged: (v) =>
+                          _update(s.copyWith(superResolutionStrength: v)),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 16),
+            const _GroupTitle('本地缓存'),
+            _VideoCacheCard(settingsRepository: settingsRepository),
+            const SizedBox(height: 16),
+            Text(
+              '说明：渲染由 media_kit 纹理管线（Direct3D 11）负责，本版本不提供渲染后端与播放内核切换。',
+              style: TextStyle(
+                  fontSize: AppType.body, color: context.palette.textSub),
+            ),
           ],
+        );
+      },
+    );
+  }
+}
+
+/// 视频缓存设置卡：开关 / 缓存目录 / 容量上限 / 已用空间与清空。
+///
+/// 只负责改偏好 —— 应用到播放引擎由 main.dart 订阅
+/// `videoCachePreferencesStream` 完成，这里不直接触碰引擎。
+class _VideoCacheCard extends StatefulWidget {
+  final SettingsRepository settingsRepository;
+
+  const _VideoCacheCard({required this.settingsRepository});
+
+  @override
+  State<_VideoCacheCard> createState() => _VideoCacheCardState();
+}
+
+class _VideoCacheCardState extends State<_VideoCacheCard> {
+  Future<int>? _sizeFuture;
+
+  /// 默认缓存根：与 main.dart 的接入保持同一处计算，避免两处漂移。
+  static String _defaultRoot() =>
+      p.join(DataDirectoryManager.currentPath, 'video_cache');
+
+  @override
+  void initState() {
+    super.initState();
+    _reloadSize();
+  }
+
+  void _reloadSize() {
+    final prefs = widget.settingsRepository.videoCachePreferences;
+    final root = prefs.directory?.trim().isNotEmpty == true
+        ? prefs.directory!.trim()
+        : _defaultRoot();
+    _sizeFuture = VideoCacheStore.totalSize(root);
+  }
+
+  void _toast(String message, {AppMessageType type = AppMessageType.info}) {
+    if (!mounted) return;
+    showAppMessage(message, type: type);
+  }
+
+  Future<void> _update(VideoCachePreferences prefs) async {
+    try {
+      await widget.settingsRepository.updateVideoCachePreferences(prefs);
+      if (!mounted) return;
+      setState(_reloadSize);
+    } catch (error) {
+      _toast('保存视频缓存偏好失败：$error', type: AppMessageType.error);
+    }
+  }
+
+  Future<void> _pickDirectory() async {
+    String? path;
+    try {
+      path = await getDirectoryPath(confirmButtonText: '选择缓存目录');
+    } catch (error) {
+      _toast('无法打开目录选择器：$error', type: AppMessageType.error);
+      return;
+    }
+    if (path == null || path.trim().isEmpty) return;
+    final prefs = widget.settingsRepository.videoCachePreferences;
+    if (path.trim() == (prefs.directory ?? '').trim()) return;
+    await _update(prefs.copyWith(directory: path.trim()));
+    _toast('视频缓存目录已改为 $path；立即生效', type: AppMessageType.success);
+  }
+
+  Future<void> _clearCache(VideoCachePreferences prefs) async {
+    final root = prefs.directory?.trim().isNotEmpty == true
+        ? prefs.directory!.trim()
+        : _defaultRoot();
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: context.palette.card,
+        title: Text('清空视频缓存',
+            style: TextStyle(
+                color: context.palette.textTitle, fontSize: AppType.heading)),
+        content: Text(
+          '将删除 $root 下的全部缓存视频（含正在下载的分片）。已下载的影片无法再从本地续看，需要重新联网加载。是否继续？',
+          style: TextStyle(
+              color: context.palette.textBody, fontSize: AppType.label),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: Text('取消', style: TextStyle(color: context.palette.textSub)),
+          ),
+          ElevatedButton(
+            style: _primaryStyle(context),
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('清空缓存'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    try {
+      final freed = await VideoCacheStore.clearAll(root);
+      if (!mounted) return;
+      setState(_reloadSize);
+      _toast(freed > 0 ? '已清空缓存，释放 ${_formatBytes(freed)}' : '缓存已经是空的',
+          type: AppMessageType.success);
+    } catch (error) {
+      _toast('清空缓存失败：$error', type: AppMessageType.error);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final repository = widget.settingsRepository;
+    return StreamBuilder<VideoCachePreferences>(
+      stream: repository.videoCachePreferencesStream,
+      initialData: repository.videoCachePreferences,
+      builder: (context, snapshot) {
+        final prefs = snapshot.data ?? const VideoCachePreferences();
+        final readFailed = repository.videoCacheReadFailed;
+        final root = prefs.directory?.trim().isNotEmpty == true
+            ? prefs.directory!.trim()
+            : _defaultRoot();
+        return _card(
+          context,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('视频缓存',
+                  style: TextStyle(
+                      fontSize: AppType.label,
+                      fontWeight: FontWeight.bold,
+                      color: context.palette.textMain)),
+              const SizedBox(height: 4),
+              Text(
+                '播放时在后台把分片下载到本地，暂停也继续；进度条上比播放位置更靠前的亮色段就是已缓存部分。',
+                style: TextStyle(
+                    fontSize: AppType.body, color: context.palette.textSub),
+              ),
+              if (readFailed)
+                Padding(
+                  padding: const EdgeInsets.only(top: 4),
+                  child: Text(
+                    '视频缓存偏好读取失败，原文件已保留；当前按默认（开启 / 默认目录 / 20GB）运行。',
+                    style: TextStyle(
+                        fontSize: AppType.body, color: context.palette.warning),
+                  ),
+                ),
+              const SizedBox(height: 10),
+              Row(
+                children: [
+                  Expanded(
+                    child: Text('开启本地缓存',
+                        style: TextStyle(
+                            fontSize: AppType.body,
+                            color: context.palette.textMain)),
+                  ),
+                  Switch(
+                    value: prefs.enabled,
+                    onChanged: readFailed
+                        ? null
+                        : (value) => unawaited(
+                            _update(prefs.copyWith(enabled: value))),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  Expanded(
+                    child: Text('缓存目录：$root',
+                        key: const ValueKey('video-cache-dir'),
+                        style: TextStyle(
+                            fontSize: AppType.body,
+                            color: context.palette.textSub)),
+                  ),
+                  TextButton(
+                    key: const ValueKey('video-cache-pick'),
+                    onPressed: readFailed ? null : _pickDirectory,
+                    child: const Text('选择目录'),
+                  ),
+                  if (prefs.directory != null)
+                    TextButton(
+                      key: const ValueKey('video-cache-reset-dir'),
+                      onPressed: readFailed
+                          ? null
+                          : () => unawaited(_update(prefs.copyWith(
+                              directory: null, clearDirectory: true))),
+                      child: const Text('恢复默认'),
+                    ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  Text('容量上限',
+                      style: TextStyle(
+                          fontSize: AppType.body,
+                          color: context.palette.textMain)),
+                  const SizedBox(width: 12),
+                  DropdownButton<int>(
+                    key: const ValueKey('video-cache-max'),
+                    value: VideoCachePreferences.maxSizeOptionsGb
+                            .contains(prefs.maxSizeGb)
+                        ? prefs.maxSizeGb
+                        : VideoCachePreferences.defaultMaxSizeGb,
+                    items: [
+                      for (final gb in VideoCachePreferences.maxSizeOptionsGb)
+                        DropdownMenuItem(
+                            value: gb, child: Text('$gb GB')),
+                    ],
+                    onChanged: readFailed
+                        ? null
+                        : (value) =>
+                            unawaited(_update(prefs.copyWith(maxSizeGb: value))),
+                    underline: const SizedBox.shrink(),
+                  ),
+                  const Spacer(),
+                  FutureBuilder<int>(
+                    future: _sizeFuture,
+                    builder: (context, snap) => Text(
+                      '已用 ${_formatBytes(snap.data ?? 0)}',
+                      key: const ValueKey('video-cache-size'),
+                      style: TextStyle(
+                          fontSize: AppType.body,
+                          color: context.palette.textSub),
+                    ),
+                  ),
+                  IconButton(
+                    key: const ValueKey('video-cache-refresh'),
+                    tooltip: '重新统计',
+                    icon: Icon(Icons.refresh_rounded,
+                        size: 18, color: context.palette.textSub),
+                    onPressed: () => setState(_reloadSize),
+                  ),
+                  TextButton(
+                    key: const ValueKey('video-cache-clear'),
+                    onPressed: () => unawaited(_clearCache(prefs)),
+                    child: const Text('清空缓存'),
+                  ),
+                ],
+              ),
+            ],
+          ),
         );
       },
     );
@@ -3077,10 +3442,14 @@ class _OptionDropdown extends StatelessWidget {
   final String value;
   final ValueChanged<String> onChanged;
 
+  /// 为 false 时灰显且不可选（例如「增强强度」依赖总开关）。
+  final bool enabled;
+
   const _OptionDropdown(
       {super.key,
       required this.options,
       required this.value,
+      this.enabled = true,
       required this.onChanged});
 
   @override
@@ -3102,9 +3471,15 @@ class _OptionDropdown extends StatelessWidget {
               child: Text(o.label, overflow: TextOverflow.ellipsis),
             ),
         ],
-        onChanged: (v) {
-          if (v != null && v != selected) onChanged(v);
-        },
+        onChanged: enabled
+            ? (v) {
+                if (v != null && v != selected) onChanged(v);
+              }
+            : null,
+        disabledHint: enabled
+            ? null
+            : Text(PlayerSettings.labelOf(options, selected),
+                overflow: TextOverflow.ellipsis),
       ),
     );
   }
@@ -3704,6 +4079,7 @@ class GeneralSettingsPanel extends StatelessWidget {
           _StorageCacheCard(
             maintenance: cacheMaintenance!,
             epgRepository: epgRepository,
+            unreadableDataFiles: configRepository.unreadableDataFiles,
           ),
         const SizedBox(height: 16),
         if (dataBackupService != null)
@@ -3864,9 +4240,13 @@ class _StorageCacheCard extends StatefulWidget {
   final CacheMaintenance maintenance;
   final EpgRepository? epgRepository;
 
+  /// 本轮没能读成功、因而禁止覆盖写的数据文件名（原文件因此得以保留）。
+  final Set<String> unreadableDataFiles;
+
   const _StorageCacheCard({
     required this.maintenance,
     this.epgRepository,
+    this.unreadableDataFiles = const {},
   });
 
   @override
@@ -4115,6 +4495,20 @@ class _StorageCacheCardState extends State<_StorageCacheCard> {
                 ],
               ),
             ),
+          // 读失败的数据文件：内存里那份空表是读失败的产物，写下去就会覆盖掉
+          // 原本还能手工修的文件，因此本轮一律拒绝覆盖 —— 必须如实告诉用户，
+          // 否则他们会以为「历史没了」。
+          if (widget.unreadableDataFiles.isNotEmpty) ...[
+            const SizedBox(height: 4),
+            Text(
+              '以下数据文件没能读成功，为保留原文件本轮已停止写入：'
+              '${widget.unreadableDataFiles.join('、')}。'
+              '关闭应用后修复或删除这些文件，重启即可恢复。',
+              key: const ValueKey('unreadable-data-files'),
+              style: TextStyle(
+                  fontSize: AppType.body, color: context.palette.warning),
+            ),
+          ],
           if (_dataStatus.migrationPending) ...[
             const SizedBox(height: 4),
             Row(
@@ -4522,8 +4916,9 @@ class _DataBackupCardState extends State<_DataBackupCard> {
                   color: context.palette.textMain)),
           const SizedBox(height: 4),
           Text(
-            '备份历史、收藏、设置、配置源与直播源等 13 个数据文件；'
-            '不含窗口状态、JRE / JAR、缓存或日志。备份可能包含订阅地址与令牌，请妥善保管。',
+            '备份历史、收藏、设置、配置源、订阅与直播源等用户数据文件；'
+            '不含窗口状态、外观偏好、可再生缓存、JRE / JAR 或日志。'
+            '备份可能包含订阅地址与令牌，请妥善保管。',
             style: TextStyle(
                 fontSize: AppType.body,
                 color: context.palette.textSub,
@@ -4669,7 +5064,7 @@ class _AppearancePanelState extends State<AppearancePanel> {
     }
   }
 
-  Future<void> _chooseTheme(AppThemeMode mode) async {
+  Future<void> _chooseThemeMode(AppThemeMode mode) async {
     final current = widget.settingsRepository.appearancePreferences;
     if (current.themeMode == mode) return;
     try {
@@ -4683,11 +5078,26 @@ class _AppearancePanelState extends State<AppearancePanel> {
     }
   }
 
+  Future<void> _chooseThemePreset(String name) async {
+    final current = widget.settingsRepository.appearancePreferences;
+    if (current.themePreset == name) return;
+    final preset = themePresetByName(name);
+    try {
+      await widget.settingsRepository
+          .updateAppearancePreferences(current.withThemePreset(preset.name));
+      _setMessage('已切换配色：${preset.label}');
+    } on DataRestorePendingRestartException catch (error) {
+      _setMessage(error.message, isError: true);
+    } catch (_) {
+      _setMessage('配色切换失败，请重试', isError: true);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return _PanelScaffold(
       title: '外观',
-      subtitle: '主题可切换深色 / 浅色 / 跟随系统；壁纸只影响主界面，浅色主题使用浅色遮罩保证文字可读。',
+      subtitle: '明暗模式与配色预设即时生效；壁纸只影响主界面，浅色主题使用浅色遮罩保证文字可读。',
       children: [
         StreamBuilder<AppearancePreferences>(
           stream: widget.settingsRepository.appearancePreferencesStream,
@@ -4698,8 +5108,10 @@ class _AppearancePanelState extends State<AppearancePanel> {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 _ThemeCard(
-                  value: preferences.themeMode,
-                  onChanged: _chooseTheme,
+                  mode: preferences.themeMode,
+                  presetName: preferences.themePreset,
+                  onModeChanged: _chooseThemeMode,
+                  onPresetChanged: _chooseThemePreset,
                 ),
                 const SizedBox(height: 16),
                 _WallpaperCard(
@@ -4729,12 +5141,19 @@ class _AppearancePanelState extends State<AppearancePanel> {
   }
 }
 
-/// 主题选择：三选一，选中态用品牌红描边。
+/// 主题选择：明暗模式 + 配色预设在同一张卡片里分区呈现。
 class _ThemeCard extends StatelessWidget {
-  final AppThemeMode value;
-  final ValueChanged<AppThemeMode> onChanged;
+  final AppThemeMode mode;
+  final String presetName;
+  final ValueChanged<AppThemeMode> onModeChanged;
+  final ValueChanged<String> onPresetChanged;
 
-  const _ThemeCard({required this.value, required this.onChanged});
+  const _ThemeCard({
+    required this.mode,
+    required this.presetName,
+    required this.onModeChanged,
+    required this.onPresetChanged,
+  });
 
   static const _icons = {
     AppThemeMode.dark: Icons.dark_mode_rounded,
@@ -4744,84 +5163,261 @@ class _ThemeCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final palette = context.palette;
+    final selected = themePresetByName(presetName);
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
-        color: context.palette.card,
+        color: palette.card,
         borderRadius: BorderRadius.circular(AppRadii.md),
-        border: Border.all(color: context.palette.border),
+        border: Border.all(color: palette.border),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text('主题',
-              style: TextStyle(
-                  fontSize: AppType.label,
-                  fontWeight: FontWeight.bold,
-                  color: context.palette.textMain)),
-          const SizedBox(height: 4),
-          Text('深色保持现有观感；跟随系统会随 Windows 的亮暗设置自动切换。',
-              style: TextStyle(
-                  fontSize: AppType.body, color: context.palette.textSub)),
-          const SizedBox(height: 12),
           Row(
             children: [
-              for (final mode in AppThemeMode.values) ...[
-                Expanded(
-                  child: FocusRing(
-                      onTap: () => onChanged(mode),
-                      semanticLabel: '主题：${mode.label}',
-                      borderRadius:
-                          const BorderRadius.all(Radius.circular(AppRadii.md)),
-                      child: InkWell(
-                        key: ValueKey('theme-mode-${mode.name}'),
+              Icon(Icons.palette_rounded, size: 18, color: palette.accentInk),
+              const SizedBox(width: AppSpacing.sm),
+              Text('主题',
+                  style: TextStyle(
+                      fontSize: AppType.label,
+                      fontWeight: FontWeight.bold,
+                      color: palette.textMain)),
+              const Spacer(),
+              Text('即时生效',
+                  style: TextStyle(fontSize: AppType.caption, color: palette.textSub)),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Text('先选明暗模式，再挑一套喜欢的配色；每套配色都自带深浅双版。',
+              style: TextStyle(fontSize: AppType.body, color: palette.textSub)),
+          const SizedBox(height: 16),
+          Text('明暗模式',
+              style: TextStyle(
+                  fontSize: AppType.caption,
+                  fontWeight: FontWeight.w600,
+                  color: palette.textSub)),
+          const SizedBox(height: 8),
+          // 紧凑分段按钮：图标与文字横排，整组靠左，不再用 Expanded 拉满宽度。
+          Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              for (final item in AppThemeMode.values) ...[
+                FocusRing(
+                  onTap: () => onModeChanged(item),
+                  semanticLabel: '主题：${item.label}',
+                  borderRadius:
+                      const BorderRadius.all(Radius.circular(AppRadii.md)),
+                  child: InkWell(
+                    key: ValueKey('theme-mode-${item.name}'),
+                    borderRadius: BorderRadius.circular(AppRadii.md),
+                    hoverColor: palette.hover,
+                    canRequestFocus: false,
+                    onTap: () => onModeChanged(item),
+                    child: Container(
+                      width: 108,
+                      height: 40,
+                      decoration: BoxDecoration(
+                        color: mode == item
+                            ? palette.accent.withValues(alpha: 0.12)
+                            : Colors.transparent,
                         borderRadius: BorderRadius.circular(AppRadii.md),
-                        hoverColor: context.palette.hover,
-                        // 焦点由外层 FocusRing 承担，避免双重焦点节点
-                        canRequestFocus: false,
-                        onTap: () => onChanged(mode),
-                        child: Container(
-                          padding: const EdgeInsets.symmetric(vertical: 12),
-                          decoration: BoxDecoration(
-                            color: value == mode
-                                ? context.palette.accent.withValues(alpha: 0.12)
-                                : Colors.transparent,
-                            borderRadius: BorderRadius.circular(AppRadii.md),
-                            border: Border.all(
-                              color: value == mode
-                                  ? context.palette.accentInk
-                                  : context.palette.border,
-                              // 选中描边取 1.5（与叠画焦点描边同宽，B6）
-                              width: value == mode ? 1.5 : 1,
-                            ),
-                          ),
-                          child: Column(
-                            children: [
-                              Icon(_icons[mode],
-                                  size: 20,
-                                  color: value == mode
-                                      ? context.palette.accentInk
-                                      : context.palette.textSub),
-                              const SizedBox(height: 6),
-                              Text(mode.label,
-                                  style: TextStyle(
-                                    fontSize: AppType.body,
-                                    fontWeight: value == mode
-                                        ? FontWeight.w600
-                                        : FontWeight.w400,
-                                    color: value == mode
-                                        ? context.palette.textMain
-                                        : context.palette.textSub,
-                                  )),
-                            ],
-                          ),
+                        border: Border.all(
+                          color: mode == item ? palette.accentInk : palette.border,
+                          width: mode == item ? 1.5 : 1,
                         ),
-                      )),
+                      ),
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Icon(_icons[item],
+                              size: 16,
+                              color: mode == item
+                                  ? palette.accentInk
+                                  : palette.textSub),
+                          const SizedBox(width: 6),
+                          Text(item.label,
+                              style: TextStyle(
+                                fontSize: AppType.body,
+                                fontWeight: mode == item
+                                    ? FontWeight.w600
+                                    : FontWeight.w400,
+                                color: mode == item
+                                    ? palette.textMain
+                                    : palette.textSub,
+                              )),
+                        ],
+                      ),
+                    ),
+                  ),
                 ),
-                if (mode != AppThemeMode.values.last) const SizedBox(width: 12),
+                if (item != AppThemeMode.values.last) const SizedBox(width: 8),
               ],
             ],
+          ),
+          const SizedBox(height: 16),
+          Divider(height: 1, color: palette.divider),
+          const SizedBox(height: 16),
+          Row(
+            children: [
+              Text('配色预设',
+                  style: TextStyle(
+                      fontSize: AppType.caption,
+                      fontWeight: FontWeight.w600,
+                      color: palette.textSub)),
+              const Spacer(),
+              Text('当前：${selected.label} · ${themePresets.length} 套',
+                  style: TextStyle(fontSize: AppType.caption, color: palette.textSub)),
+            ],
+          ),
+          const SizedBox(height: 10),
+          LayoutBuilder(
+            builder: (context, constraints) {
+              const spacing = 12.0;
+              final columns = constraints.maxWidth >= 760
+                  ? 4
+                  : constraints.maxWidth >= 560
+                      ? 3
+                      : 2;
+              final tileWidth = ((constraints.maxWidth - spacing * (columns - 1)) /
+                      columns)
+                  .clamp(120.0, 220.0)
+                  .toDouble();
+              return Wrap(
+                spacing: spacing,
+                runSpacing: spacing,
+                children: [
+                  for (final item in themePresets)
+                    SizedBox(
+                      width: tileWidth,
+                      child: _PresetTile(
+                        preset: item,
+                        selected: item.name == selected.name,
+                        onTap: () => onPresetChanged(item.name),
+                      ),
+                    ),
+                ],
+              );
+            },
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// 配色色卡：上半部是深/浅双预览，下半部是名称与选中标记。
+class _PresetTile extends StatelessWidget {
+  final AppThemePreset preset;
+  final bool selected;
+  final VoidCallback onTap;
+
+  const _PresetTile({
+    required this.preset,
+    required this.selected,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final palette = context.palette;
+    return FocusRing(
+      onTap: onTap,
+      semanticLabel: '配色：${preset.label}',
+      borderRadius: const BorderRadius.all(Radius.circular(AppRadii.md)),
+      child: InkWell(
+        key: ValueKey('theme-preset-${preset.name}'),
+        borderRadius: BorderRadius.circular(AppRadii.md),
+        hoverColor: palette.hover,
+        canRequestFocus: false,
+        onTap: onTap,
+        child: Container(
+          padding: const EdgeInsets.all(8),
+          decoration: BoxDecoration(
+            color: selected
+                ? palette.accentWash
+                : palette.raised.withValues(alpha: 0.35),
+            borderRadius: BorderRadius.circular(AppRadii.md),
+            border: Border.all(
+              color: selected ? palette.accentInk : palette.border,
+              width: selected ? 1.5 : 1,
+            ),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              ClipRRect(
+                borderRadius: BorderRadius.circular(AppRadii.sm),
+                child: SizedBox(
+                  height: 40,
+                  child: Row(
+                    children: [
+                      Expanded(child: _PresetPreview(palette: preset.dark)),
+                      const SizedBox(width: 2),
+                      Expanded(child: _PresetPreview(palette: preset.light)),
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      preset.label,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: AppType.body,
+                        fontWeight:
+                            selected ? FontWeight.w600 : FontWeight.w400,
+                        color: selected ? palette.textTitle : palette.textMain,
+                      ),
+                    ),
+                  ),
+                  if (selected)
+                    Icon(Icons.check_circle_rounded,
+                        size: 14, color: palette.accentInk),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _PresetPreview extends StatelessWidget {
+  final AppPalette palette;
+
+  const _PresetPreview({required this.palette});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      color: palette.background,
+      padding: const EdgeInsets.all(6),
+      child: Row(
+        children: [
+          Container(width: 6, height: double.infinity, color: palette.accentInk),
+          const SizedBox(width: 4),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Container(
+                  height: 5,
+                  color: palette.textSub.withValues(alpha: 0.7),
+                ),
+                const SizedBox(height: 3),
+                Expanded(child: Container(color: palette.card)),
+                const SizedBox(height: 3),
+                Container(height: 4, width: 16, color: palette.accent),
+              ],
+            ),
           ),
         ],
       ),
@@ -4912,7 +5508,7 @@ class _WallpaperCard extends StatelessWidget {
           const SizedBox(height: 12),
           Text(
             '「恢复默认」只删除应用内的副本，不会删除你的原图；'
-            '壁纸不计入数据备份（备份只含配置 / 收藏 / 历史等 13 个文件）。',
+            '壁纸不计入数据备份（备份只含配置 / 收藏 / 历史等用户数据文件）。',
             style: TextStyle(
                 fontSize: AppType.caption, color: context.palette.textSub),
           ),

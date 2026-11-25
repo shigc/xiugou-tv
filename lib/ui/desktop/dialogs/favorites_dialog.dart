@@ -2,6 +2,7 @@ import 'dart:ui';
 import 'package:flutter/material.dart';
 import '../../../core/api/models/vod_models.dart';
 import '../../../core/config/models/vod_config.dart';
+import 'package:xiugou_tv/core/follow/follow_record.dart';
 import '../../theme/app_palette.dart';
 import '../../theme/app_tokens.dart';
 import '../catalog/poster_image.dart';
@@ -29,6 +30,11 @@ class FavoritesDialog extends StatefulWidget {
   final ValueChanged<Live>? onLiveTap;
   final Future<String?> Function(String key)? onRemoveLiveItem;
 
+  /// 追剧记录（§新功能）。[onFollowTap] 为 null 时不展示「追剧」分栏。
+  final List<FollowRecord> follows;
+  final ValueChanged<FollowRecord>? onFollowTap;
+  final Future<String?> Function(String id)? onRemoveFollow;
+
   const FavoritesDialog({
     super.key,
     required this.items,
@@ -37,6 +43,9 @@ class FavoritesDialog extends StatefulWidget {
     this.liveItems = const [],
     this.onLiveTap,
     this.onRemoveLiveItem,
+    this.follows = const [],
+    this.onFollowTap,
+    this.onRemoveFollow,
   });
 
   @override
@@ -46,10 +55,11 @@ class FavoritesDialog extends StatefulWidget {
 class _FavoritesDialogState extends State<FavoritesDialog> {
   late final List<VodItem> _items = List.of(widget.items);
   late final List<Live> _liveItems = List.of(widget.liveItems);
+  late final List<FollowRecord> _follows = List.of(widget.follows);
   String? _error;
   bool _removing = false;
 
-  /// 0 = 点播收藏，1 = 直播收藏。
+  /// 0 = 点播收藏，1 = 直播收藏，2 = 追剧。
   int _tab = 0;
 
   Future<void> _remove(String id) async {
@@ -82,6 +92,23 @@ class _FavoritesDialogState extends State<FavoritesDialog> {
     setState(() {
       _error = null;
       _liveItems.removeWhere((e) => e.key == key);
+    });
+  }
+
+  Future<void> _removeFollow(String id) async {
+    final remove = widget.onRemoveFollow;
+    if (_removing || remove == null) return;
+    _removing = true;
+    final message = await remove(id);
+    _removing = false;
+    if (!mounted) return;
+    if (message != null) {
+      setState(() => _error = message);
+      return;
+    }
+    setState(() {
+      _error = null;
+      _follows.removeWhere((e) => e.id == id);
     });
   }
 
@@ -167,7 +194,9 @@ class _FavoritesDialogState extends State<FavoritesDialog> {
                           Text(
                             _tab == 0
                                 ? '共收藏 ${_items.length} 部影片'
-                                : '共收藏 ${_liveItems.length} 个直播频道',
+                                : _tab == 1
+                                    ? '共收藏 ${_liveItems.length} 个直播频道'
+                                    : '共追 ${_follows.length} 部剧集',
                             style: TextStyle(
                               fontSize: AppType.label,
                               color: palette.textSub,
@@ -262,8 +291,8 @@ class _FavoritesDialogState extends State<FavoritesDialog> {
                     ),
                   ),
 
-                // 分栏：点播 / 直播（§33）。仅在调用方提供直播收藏能力时出现。
-                if (widget.onLiveTap != null)
+                // 分栏：点播 / 直播 / 追剧（§33）。仅在调用方提供对应能力时出现。
+                if (widget.onLiveTap != null || widget.onFollowTap != null)
                   Padding(
                     padding: const EdgeInsets.fromLTRB(24, 14, 24, 0),
                     child: Row(
@@ -279,16 +308,34 @@ class _FavoritesDialogState extends State<FavoritesDialog> {
                           onSelected: (_) => setState(() => _tab = 0),
                         ),
                         const SizedBox(width: 8),
-                        ChoiceChip(
-                          key: const ValueKey('favorites-tab-live'),
-                          label: Text('直播 ${_liveItems.length}'),
-                          labelStyle: TextStyle(
-                              color: palette.textBody, fontSize: AppType.body),
-                          backgroundColor: palette.raised,
-                          selectedColor: palette.accent.withValues(alpha: 0.22),
-                          selected: _tab == 1,
-                          onSelected: (_) => setState(() => _tab = 1),
-                        ),
+                        if (widget.onLiveTap != null)
+                          ChoiceChip(
+                            key: const ValueKey('favorites-tab-live'),
+                            label: Text('直播 ${_liveItems.length}'),
+                            labelStyle: TextStyle(
+                                color: palette.textBody,
+                                fontSize: AppType.body),
+                            backgroundColor: palette.raised,
+                            selectedColor:
+                                palette.accent.withValues(alpha: 0.22),
+                            selected: _tab == 1,
+                            onSelected: (_) => setState(() => _tab = 1),
+                          ),
+                        if (widget.onFollowTap != null) ...[
+                          const SizedBox(width: 8),
+                          ChoiceChip(
+                            key: const ValueKey('favorites-tab-follow'),
+                            label: Text('追剧 ${_follows.length}'),
+                            labelStyle: TextStyle(
+                                color: palette.textBody,
+                                fontSize: AppType.body),
+                            backgroundColor: palette.raised,
+                            selectedColor:
+                                palette.accent.withValues(alpha: 0.22),
+                            selected: _tab == 2,
+                            onSelected: (_) => setState(() => _tab = 2),
+                          ),
+                        ],
                       ],
                     ),
                   ),
@@ -365,6 +412,7 @@ class _FavoritesDialogState extends State<FavoritesDialog> {
                           ),
                   ),
                 if (_tab == 1) Expanded(child: _buildLiveTab(context)),
+                if (_tab == 2) Expanded(child: _buildFollowTab(context)),
               ],
             ),
           ),
@@ -476,6 +524,180 @@ class _FavoritesDialogState extends State<FavoritesDialog> {
                       visualDensity: VisualDensity.compact,
                     ),
                     Icon(Icons.play_circle_outline_rounded,
+                        size: 22, color: palette.accentInk),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  /// 追剧列表（§新功能）：展示已知集数与未看数，有更新时高亮角标。
+  Widget _buildFollowTab(BuildContext context) {
+    final palette = AppPalette.of(context);
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+
+    if (_follows.isEmpty) {
+      return Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.favorite_outline_rounded,
+                size: 38, color: palette.textDim),
+            const SizedBox(height: 16),
+            Text(
+              '暂无追剧',
+              style: TextStyle(
+                color: palette.textTitle,
+                fontSize: AppType.title,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            const SizedBox(height: 6),
+            Text(
+              '在影片详情页点击「♡」即可追剧，有更新会提醒你',
+              style: TextStyle(color: palette.textSub, fontSize: AppType.body),
+            ),
+          ],
+        ),
+      );
+    }
+
+    // 有更新的排前面，其余按追的时间倒序。
+    final sorted = List.of(_follows)
+      ..sort((a, b) {
+        if (a.hasUpdate != b.hasUpdate) return a.hasUpdate ? -1 : 1;
+        return b.followedAt.compareTo(a.followedAt);
+      });
+
+    return ListView.separated(
+      padding: const EdgeInsets.fromLTRB(24, 16, 24, 24),
+      itemCount: sorted.length,
+      separatorBuilder: (_, __) => const SizedBox(height: 8),
+      itemBuilder: (context, index) {
+        final record = sorted[index];
+        final sourceLost = record.siteKey == null || record.siteKey!.isEmpty;
+        return Container(
+          key: ValueKey('follow-${record.id}'),
+          decoration: BoxDecoration(
+            color: palette.card,
+            borderRadius: BorderRadius.circular(AppRadii.sm),
+            border: Border.all(
+              color: record.hasUpdate
+                  ? palette.accentInk.withValues(alpha: 0.55)
+                  : isDark
+                      ? Colors.white.withValues(alpha: 0.08)
+                      : palette.border,
+            ),
+          ),
+          clipBehavior: Clip.antiAlias,
+          child: Material(
+            color: Colors.transparent,
+            child: InkWell(
+              onTap: () {
+                Navigator.of(context).pop();
+                widget.onFollowTap?.call(record);
+              },
+              hoverColor: palette.hover,
+              child: Padding(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                child: Row(
+                  children: [
+                    // 小海报
+                    ClipRRect(
+                      borderRadius: BorderRadius.circular(AppRadii.xs),
+                      child: Image(
+                        image:
+                            posterImageProvider(record.vodPic, targetWidth: 96) ??
+                                ResizeImage(NetworkImage(record.vodPic),
+                                    width: 96),
+                        width: 36,
+                        height: 48,
+                        fit: BoxFit.cover,
+                        errorBuilder: (_, __, ___) => Container(
+                          width: 36,
+                          height: 48,
+                          color: palette.raised,
+                          child: Icon(Icons.movie_outlined,
+                              size: 18, color: palette.textDim),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            children: [
+                              Flexible(
+                                child: Text(
+                                  record.vodName,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(
+                                    color: palette.textTitle,
+                                    fontSize: AppType.title,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                              ),
+                              if (record.hasUpdate) ...[
+                                const SizedBox(width: 8),
+                                Container(
+                                  padding: const EdgeInsets.symmetric(
+                                      horizontal: 8, vertical: 2),
+                                  decoration: BoxDecoration(
+                                    color: palette.danger.withValues(alpha: 0.15),
+                                    borderRadius:
+                                        BorderRadius.circular(AppRadii.pill),
+                                    border: Border.all(
+                                        color:
+                                            palette.danger.withValues(alpha: 0.5)),
+                                  ),
+                                  child: Text(
+                                    '${record.unseenEpisodes} 集更新',
+                                    style: TextStyle(
+                                      color: palette.danger,
+                                      fontSize: AppType.caption,
+                                      fontWeight: FontWeight.w600,
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ],
+                          ),
+                          const SizedBox(height: 2),
+                          Text(
+                            sourceLost
+                                ? '来源站源已失效，点击后将在当前站源中查找'
+                                : [
+                                    if (record.siteName != null)
+                                      record.siteName!,
+                                    '已看 ${record.seenEpisodes} / ${record.knownEpisodes} 集',
+                                  ].join(' · '),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                                color: palette.textSub,
+                                fontSize: AppType.body),
+                          ),
+                        ],
+                      ),
+                    ),
+                    IconButton(
+                      key: ValueKey('follow-remove-${record.id}'),
+                      tooltip: '取消追剧',
+                      onPressed: () => _removeFollow(record.id),
+                      icon: const Icon(Icons.close_rounded, size: 18),
+                      color: palette.textSub,
+                      visualDensity: VisualDensity.compact,
+                    ),
+                    Icon(Icons.play_circle_outline,
                         size: 22, color: palette.accentInk),
                   ],
                 ),

@@ -1,11 +1,23 @@
 import 'dart:convert';
 import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart';
 import 'package:xml/xml.dart';
 import '../bounded_map.dart';
 import '../config/models/vod_config.dart';
 import '../net/http_client_factory.dart';
 import 'epg_program.dart';
 import 'live_text_loader.dart';
+
+/// 在 isolate 里解析节目单（JSON 与 XML 都走这条）。
+///
+/// 一个频道一天的节目上百条，多频道合并后体量更大；在主线程解析会吃掉几十
+/// 毫秒，正好压在「切台 / 打开节目单」这些最需要跟手的时刻。
+Future<_EpgFeed> _parseEpgFeedInIsolate(String content, DateTime requestedDay) {
+  return compute(_parseEpgFeed, (content: content, day: requestedDay));
+}
+
+_EpgFeed _parseEpgFeed(({String content, DateTime day}) args) =>
+    _EpgFeed.parse(args.content, args.day);
 
 /// 按需加载 EPG，同源请求合并；不以节目单成功与否决定频道能否播放。
 class EpgRepository {
@@ -64,7 +76,7 @@ class EpgRepository {
   Future<_EpgFeed> _fetch(String url, DateTime day, String key) async {
     try {
       final document = await loadLiveText(Uri.parse(url), dio: _dio);
-      final feed = _EpgFeed.parse(document.content, day);
+      final feed = await _parseEpgFeedInIsolate(document.content, day);
       if (!_disposed) {
         _cache.putBounded(key, (time: _clock(), feed: feed), 12);
       }

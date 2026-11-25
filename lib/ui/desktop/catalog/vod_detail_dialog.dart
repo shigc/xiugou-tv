@@ -111,6 +111,12 @@ class VodDetailDialog extends StatefulWidget {
   final bool isFavorite;
   final Future<String?> Function()? onToggleFavorite;
 
+  /// 是否已在追这部剧（由宿主传入，同站同片唯一）。
+  final bool isFollowed;
+
+  /// 切换追剧状态；返回 `null` 表示成功，返回文案表示失败原因。
+  final Future<String?> Function()? onToggleFollow;
+
   /// 当前播放集；为 `null` 时与改动前完全一致（普通浏览零高亮）。
   final CurrentEpisode? currentEpisode;
 
@@ -133,6 +139,8 @@ class VodDetailDialog extends StatefulWidget {
     required this.onPlayEpisode,
     this.isFavorite = false,
     this.onToggleFavorite,
+    this.isFollowed = false,
+    this.onToggleFollow,
     this.currentEpisode,
     this.onOpenUrl,
     this.lastWatched,
@@ -152,6 +160,8 @@ class _VodDetailDialogState extends State<VodDetailDialog> {
   int _selectedSourceIndex = 0;
   late bool _favorited;
   bool _favoriteBusy = false;
+  late bool _followed;
+  bool _followBusy = false;
   String? _error;
 
   /// 播放源横栏的横向滚动控制器（滚轮 / 拖拽共用）。
@@ -228,6 +238,7 @@ class _VodDetailDialogState extends State<VodDetailDialog> {
   void initState() {
     super.initState();
     _favorited = widget.isFavorite;
+    _followed = widget.isFollowed;
     _selectedSourceIndex = _initialSourceIndex();
   }
 
@@ -484,8 +495,10 @@ class _VodDetailDialogState extends State<VodDetailDialog> {
                   Expanded(
                     child: SingleChildScrollView(
                       child: Text(
+                        // 站源简介常带 HTML（<p><span style=...>）与实体（&quot;），
+                        // 原样渲染会把标签文本暴露给用户（2026-10-30 用户反馈）。
                         (item.content?.isNotEmpty ?? false)
-                            ? item.content!
+                            ? stripHtmlToPlainText(item.content!)
                             : '暂无详细简介。',
                         style: TextStyle(
                           fontSize: AppType.body,
@@ -551,6 +564,47 @@ class _VodDetailDialogState extends State<VodDetailDialog> {
                       // §49 复制网盘分享链接（详情里有链接才显示）
                       if (_shareLinks.isNotEmpty)
                         _buildShareLinkButton(palette),
+
+                      // 追剧按钮：关注剧集，追更提醒依赖它
+                      if (widget.onToggleFollow != null)
+                        FocusRing(
+                          onTap: () {},
+                          semanticLabel: '追剧',
+                          borderRadius: const BorderRadius.all(
+                              Radius.circular(AppRadii.pill)),
+                          child: IconButton(
+                            icon: Icon(
+                              _followed
+                                  ? Icons.favorite_rounded
+                                  : Icons.favorite_outline_rounded,
+                              color:
+                                  _followed ? palette.danger : palette.textSub,
+                              size: 21,
+                            ),
+                            tooltip: _followed ? '已在追 (点击取消)' : '追这部剧',
+                            onPressed: _followBusy
+                                ? null
+                                : () async {
+                                    final previous = _followed;
+                                    setState(() {
+                                      _followBusy = true;
+                                      _followed = !previous;
+                                      _error = null;
+                                    });
+                                    final message =
+                                        await widget.onToggleFollow!();
+                                    if (!mounted) return;
+                                    setState(() {
+                                      _followBusy = false;
+                                      if (message != null) {
+                                        _followed = previous;
+                                        _error = message;
+                                      }
+                                    });
+                                  },
+                          ),
+                        ),
+                      const SizedBox(width: 4),
 
                       // 收藏按钮
                       if (widget.onToggleFavorite != null)

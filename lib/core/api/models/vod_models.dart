@@ -1,4 +1,69 @@
 import '../episode_natural_order.dart';
+/// 剧情简介清洗：站源常把 HTML（`<p><span style=...>`）和 HTML 实体
+/// （`&quot;` / `&amp;` / `&nbsp;` / 数字实体）直接塞进 `vod_content`，
+/// 原样渲染会把标签文本暴露给用户。删标签 → 解码常见命名实体 →
+/// 解码十/十六进制数字实体 → 折叠空白。
+String stripHtmlToPlainText(String raw) {
+  var text = raw.replaceAll(RegExp(r'<[^>]*>'), ' ');
+  const named = <String, String>{
+    '&quot;': '"',
+    '&apos;': "'",
+    '&#39;': "'",
+    '&nbsp;': ' ',
+    '&lt;': '<',
+    '&gt;': '>',
+    '&amp;': '&', // 放最后：避免 `&amp;quot;` 被二次解码
+  };
+  named.forEach((entity, char) {
+    text = text.replaceAll(entity, char);
+  });
+  // 数字实体：十进制 `&#88;` 与十六进制 `&#x58;`
+  text = text.replaceAllMapped(RegExp(r'&#(\d+);'), (m) {
+    final code = int.tryParse(m.group(1)!);
+    return code != null && code > 0 && code < 0x110000
+        ? String.fromCharCode(code)
+        : m.group(0)!;
+  });
+  text = text.replaceAllMapped(RegExp(r'&#x([0-9a-fA-F]+);'), (m) {
+    final code = int.tryParse(m.group(1)!, radix: 16);
+    return code != null && code > 0 && code < 0x110000
+        ? String.fromCharCode(code)
+        : m.group(0)!;
+  });
+  // 标签位置换成了空格，折叠多余空白
+  return text.replaceAll(RegExp(r'[ \t]{2,}'), ' ').trim();
+}
+
+/// 演员表清洗：部分站源（AppleCMS 系）的 `vod_actor` / `vod_director` 是
+/// BBCode 链接 `[a=cr({"id":"xx","name":"yy"})]名字[/a]`，原样渲染会把
+/// 内部结构暴露给用户（2026-10-31 用户反馈）。
+/// 提取每个链接的显示名（内部文本），内部为空时退回 JSON 的 `name` 字段；
+/// 无 BBCode 时回落到通用 HTML 清洗，保证纯名字列表原样通过。
+String cleanCastList(String raw) {
+  final link = RegExp(r'\[a=[^\]]*\]([^\[\]]*)\[/a\]', caseSensitive: false);
+  if (link.hasMatch(raw)) {
+    final nameField = RegExp(r'"name"\s*:\s*"([^"]*)"');
+    final names = <String>[];
+    for (final m in link.allMatches(raw)) {
+      final inner = m.group(1)?.trim() ?? '';
+      if (inner.isNotEmpty) {
+        names.add(inner);
+        continue;
+      }
+      final jsonName = nameField.firstMatch(m.group(0)!);
+      final n = jsonName?.group(1)?.trim() ?? '';
+      if (n.isNotEmpty) names.add(n);
+    }
+    if (names.isNotEmpty) return names.join(' ');
+  }
+  return stripHtmlToPlainText(raw);
+}
+
+String? _cleanCast(String? raw) {
+  if (raw == null) return null;
+  final cleaned = cleanCastList(raw);
+  return cleaned.isEmpty ? null : cleaned;
+}
 
 /// 影视点播摘要项（用于列表卡片展示与跨站聚合搜索）
 class VodItem {
@@ -105,8 +170,8 @@ class VodItem {
       remarks: json['vod_remarks']?.toString() ?? json['remarks']?.toString() ?? json['note']?.toString(),
       year: json['vod_year']?.toString() ?? json['year']?.toString(),
       area: json['vod_area']?.toString() ?? json['area']?.toString(),
-      actor: json['vod_actor']?.toString() ?? json['actor']?.toString(),
-      director: json['vod_director']?.toString() ?? json['director']?.toString(),
+      actor: _cleanCast(json['vod_actor']?.toString() ?? json['actor']?.toString()),
+      director: _cleanCast(json['vod_director']?.toString() ?? json['director']?.toString()),
       content: json['vod_content']?.toString() ?? json['content']?.toString() ?? json['des']?.toString(),
       typeName: json['type_name']?.toString() ?? json['type']?.toString(),
       score: (rawScore != null && rawScore.isNotEmpty && rawScore != '0' && rawScore != '0.0') ? rawScore : null,
@@ -284,8 +349,8 @@ class VodDetail {
       content: des.isNotEmpty ? des : null,
       year: year.isNotEmpty ? year : null,
       area: area.isNotEmpty ? area : null,
-      actor: actor.isNotEmpty ? actor : null,
-      director: director.isNotEmpty ? director : null,
+      actor: _cleanCast(actor),
+      director: _cleanCast(director),
       siteKey: siteKey,
       siteName: siteName,
     );

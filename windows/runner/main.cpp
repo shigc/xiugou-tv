@@ -19,8 +19,9 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
 
   flutter::DartProject project(L"data");
 
-  // Disable experimental Impeller backend and use stable Skia Direct3D renderer.
-  project.set_impeller_switch(flutter::ImpellerSwitch::Disabled);
+  // NOTE: DartProject::set_impeller_switch() was removed in Flutter 3.44.
+  // Windows desktop still defaults to Skia (D3D); Impeller requires the
+  // explicit --enable-impeller switch, so the behaviour is unchanged.
 
   std::vector<std::string> command_line_arguments =
       GetCommandLineArguments();

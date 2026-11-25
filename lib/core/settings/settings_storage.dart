@@ -11,6 +11,7 @@ import 'models/history_preferences.dart';
 import 'models/network_preferences.dart';
 import 'models/play_skip_preferences.dart';
 import 'models/search_preferences.dart';
+import 'models/video_cache_preferences.dart';
 import 'models/self_check_preferences.dart';
 import 'models/startup_preferences.dart';
 
@@ -61,6 +62,13 @@ abstract class SettingsStorage {
 
   /// 缺省实现：写入用户数据目录（便携版 `<exe>/user_data`，安装目录不可写时回退
   /// `%APPDATA%/XiugouTV`，路径解析见 `DataDirectoryManager`）
+  /// 读取视频本地缓存偏好；文件不存在或内容为空时返回 null（首启按默认
+  /// 「开启 / 默认目录 / 20GB」处理），结构 / 版本 / 字段类型非法时抛出
+  /// [FormatException]（调用方保留原文件并提示）
+  Future<VideoCachePreferences?> readVideoCachePreferences();
+  Future<void> saveVideoCachePreferences(VideoCachePreferences preferences);
+
+  /// 缺省实现：写入 %APPDATA%/XiugouTV
   factory SettingsStorage.windows({Future<Directory> Function()? directory}) = FileSettingsStorage;
 }
 
@@ -75,6 +83,8 @@ class FileSettingsStorage implements SettingsStorage, ConfigSourceCatalogStorage
   static const String playSkipPreferencesFileName = 'play_skip_preferences.json';
   static const String appearancePreferencesFileName = 'appearance_preferences.json';
   static const String networkPreferencesFileName = 'network_preferences.json';
+  static const String videoCachePreferencesFileName =
+      'video_cache_preferences.json';
 
   final Future<Directory> Function() _directory;
   static int _temporarySequence = 0;
@@ -255,6 +265,26 @@ class FileSettingsStorage implements SettingsStorage, ConfigSourceCatalogStorage
   @override
   Future<void> saveNetworkPreferences(NetworkPreferences preferences) async {
     await _atomicWrite(await _file(networkPreferencesFileName), jsonEncode(preferences.toJson()));
+  }
+
+  @override
+  Future<VideoCachePreferences?> readVideoCachePreferences() async {
+    final decoded = await _readJson(videoCachePreferencesFileName);
+    if (decoded == null) return null;
+    if (decoded is! Map) throw const FormatException('视频缓存偏好格式无效');
+    final map = <String, dynamic>{};
+    for (final entry in decoded.entries) {
+      if (entry.key is! String) throw const FormatException('视频缓存偏好格式无效');
+      map[entry.key as String] = entry.value;
+    }
+    return VideoCachePreferences.fromJson(map);
+  }
+
+  @override
+  Future<void> saveVideoCachePreferences(
+      VideoCachePreferences preferences) async {
+    await _atomicWrite(await _file(videoCachePreferencesFileName),
+        jsonEncode(preferences.toJson()));
   }
 
   /// 同目录替换成功前不删除旧文件；失败时尽力清理临时文件。

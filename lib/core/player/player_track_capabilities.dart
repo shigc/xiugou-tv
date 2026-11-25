@@ -13,7 +13,10 @@ abstract class VideoTrackCapable {
   Future<void> selectVideoTrack(TrackInfo track);
 }
 
-/// 可选能力：关闭字幕（不选择具体字幕轨）。
+/// 可选能力：关闭字幕（不选择具体字幕轨）与外挂字幕文件。
 abstract class SubtitleTrackCapable {
   Future<void> disableSubtitle();
+
+  /// 加载本地外挂字幕（srt / ass / ssa / vtt），加载后成为当前选中的字幕轨。
+  Future<void> addSubtitleFile(String path);
 }

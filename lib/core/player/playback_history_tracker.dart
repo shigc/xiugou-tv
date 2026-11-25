@@ -28,7 +28,10 @@ class PlaybackHistoryTracker {
   PlaybackHistoryTracker({
     required PlayerEngine engine,
     required ConfigRepository repository,
-    this.saveInterval = const Duration(seconds: 5),
+    // 每落一次盘都是整表 jsonEncode + 原子重写。5 秒一次在长时播放下会持续
+    // 制造 IO 抖动（正好和解码、网络抢资源）；放宽到 15 秒。
+    // 暂停 / 播完 / 切集 / 退出都会强制 flush，断点续播的精度不受影响。
+    this.saveInterval = const Duration(seconds: 15),
   })  : _engine = engine,
         _repository = repository;
 

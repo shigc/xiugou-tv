@@ -6,6 +6,7 @@ import '../player/models/player_state.dart';
 import 'parse_engine.dart';
 import 'search_cancel_token.dart';
 import '../companion/companion_process_manager.dart';
+import '../diagnostics/app_logger.dart';
 import '../diagnostics/error_log.dart';
 import '../companion/companion_spider_api.dart';
 import '../config/models/vod_config.dart';
@@ -85,7 +86,7 @@ class SiteApi {
   bool _prewarmAttempted = false;
 
   Future<void> prewarmCompanionJars(List<Site> sites,
-      {int limit = 1, bool force = false}) async {
+      {Site? preferredSite, int limit = 1, bool force = false}) async {
     // 已有一次预热在跑就不重复（启动触发 + 配置加载触发可能同时到）。
     if (prewarm.value.running) return;
     // 每个进程只自动预热一次：loadSiteData 会在切站 / 换分类 / 刷新时反复调用，
@@ -94,7 +95,23 @@ class SiteApi {
     final run = ++_prewarmRun;
     final seen = <String>{};
     final targets = <Site>[];
+    // 当前选中的站点优先：之前按配置顺序取第一个 jar，用户实际用的站可能是第二个，
+    // 首屏预热完第一个后点开第二个仍要等十几秒冷加载。按 jar 去重后依次取 limit 个。
+    final candidates = <Site>[];
+    if (preferredSite != null &&
+        preferredSite.usesCompanion &&
+        (preferredSite.jar ?? '').isNotEmpty) {
+      candidates.add(preferredSite);
+    }
     for (final site in sites) {
+      if (preferredSite != null &&
+          site.key.isNotEmpty &&
+          site.key == preferredSite.key) {
+        continue;
+      }
+      candidates.add(site);
+    }
+    for (final site in candidates) {
       if (targets.length >= limit) break;
       if (!site.usesCompanion) continue;
       final jar = site.jar ?? '';
@@ -352,7 +369,7 @@ class SiteApi {
       result = await cmsApi.fetchPlayResult(site, flag: flag, id: id);
     } else {
       if (!await _ensureCompanionReady(site)) {
-        throw const FormatException('Companion 服务不可用');
+        throw const CompanionRpcException('Companion 服务不可用');
       }
       result = await companionSpiderApi.fetchPlayResult(site, flag: flag, id: id);
     }
@@ -434,8 +451,10 @@ class SiteApi {
     final uri = Uri.tryParse(resolved.url);
     if (uri == null || !['http', 'https', 'rtmp', 'rtsp', 'file'].contains(uri.scheme) ||
         (uri.scheme != 'file' && uri.host.isEmpty)) {
-      debugPrint('--> [播放地址无效] site=${siteKey ?? '(清晰度切换)'} flag=$flag needsParse=${quality.needsParse} '
-          'scheme=${uri?.scheme} host=${uri?.host} len=${resolved.url.length}');
+      AppLogger.instance.warning('site-api',
+          '播放地址无效：site=${siteKey ?? '(清晰度切换)'} flag=$flag '
+          'needsParse=${quality.needsParse} scheme=${uri?.scheme} '
+          'host=${uri?.host} len=${resolved.url.length}');
       throw const FormatException('Spider 未返回有效媒体地址');
     }
     return PlaybackQuality(
@@ -462,7 +481,7 @@ class SiteApi {
   Future<String> performAction(Site site, String action) async {
     if (!site.usesCompanion) return '';
     if (!await _ensureCompanionReady(site)) {
-      throw const FormatException('Companion 服务不可用');
+      throw const CompanionRpcException('Companion 服务不可用');
     }
     return companionSpiderApi.performAction(site, action);
   }
@@ -474,7 +493,7 @@ class SiteApi {
     }
     if (!site.usesCompanion) return id;
     if (!await _ensureCompanionReady(site)) {
-      throw const FormatException('Companion 服务不可用');
+      throw const CompanionRpcException('Companion 服务不可用');
     }
     return companionSpiderApi.fetchPlayUrl(site, flag: flag, id: id);
   }

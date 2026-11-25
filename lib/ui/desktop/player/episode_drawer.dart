@@ -357,10 +357,13 @@ class _EpisodeDrawerLayerState extends State<EpisodeDrawerLayer> {
             opacity: widget.open ? 1 : 0,
             child: IgnorePointer(
               ignoring: !widget.open,
-              child: GestureDetector(
-                behavior: HitTestBehavior.opaque,
-                onTap: widget.onClose,
-                child: const ColoredBox(color: Color(0x66000000)),
+              child: MouseRegion(
+                cursor: SystemMouseCursors.click,
+                child: GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTap: widget.onClose,
+                  child: const ColoredBox(color: Color(0x66000000)),
+                ),
               ),
             ),
           ),
@@ -575,52 +578,55 @@ class _EpisodeDrawerLayerState extends State<EpisodeDrawerLayer> {
               semanticLabel: line.unavailable ? '${line.name}（不可用）' : line.name,
               borderRadius:
                   const BorderRadius.all(Radius.circular(AppRadii.pill)),
-              child: AnimatedOpacity(
-                duration: AppMotion.exit,
-                opacity: disabled && !line.current ? 0.4 : 1,
-                child: GestureDetector(
-                  behavior: HitTestBehavior.opaque,
-                  onTap: disabled
-                      ? null
-                      : () {
-                          if (!line.browsing) nav.onSelectLine(line.index);
-                        },
-                  child: Container(
-                    alignment: Alignment.center,
-                    padding: const EdgeInsets.symmetric(horizontal: 14),
-                    decoration: BoxDecoration(
-                      color: background,
-                      borderRadius: BorderRadius.circular(AppRadii.pill),
-                      border: Border.all(
-                        color: line.current || line.browsing
-                            ? palette.accentInk.withValues(alpha: 0.6)
-                            : palette.playerText.withValues(alpha: 0.10),
-                        width: 1,
+              child: MouseRegion(
+                cursor: SystemMouseCursors.click,
+                child: AnimatedOpacity(
+                  duration: AppMotion.exit,
+                  opacity: disabled && !line.current ? 0.4 : 1,
+                  child: GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onTap: disabled
+                        ? null
+                        : () {
+                            if (!line.browsing) nav.onSelectLine(line.index);
+                          },
+                    child: Container(
+                      alignment: Alignment.center,
+                      padding: const EdgeInsets.symmetric(horizontal: 14),
+                      decoration: BoxDecoration(
+                        color: background,
+                        borderRadius: BorderRadius.circular(AppRadii.pill),
+                        border: Border.all(
+                          color: line.current || line.browsing
+                              ? palette.accentInk.withValues(alpha: 0.6)
+                              : palette.playerText.withValues(alpha: 0.10),
+                          width: 1,
+                        ),
                       ),
-                    ),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        if (line.current) ...[
-                          Icon(Icons.play_arrow_rounded,
-                              size: 13, color: foreground),
-                          const SizedBox(width: 2),
-                        ],
-                        Flexible(
-                          child: Text(
-                            line.name,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
-                              color: foreground,
-                              fontSize: AppType.caption,
-                              fontWeight: line.current
-                                  ? FontWeight.bold
-                                  : FontWeight.w500,
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          if (line.current) ...[
+                            Icon(Icons.play_arrow_rounded,
+                                size: 13, color: foreground),
+                            const SizedBox(width: 2),
+                          ],
+                          Flexible(
+                            child: Text(
+                              line.name,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                color: foreground,
+                                fontSize: AppType.caption,
+                                fontWeight: line.current
+                                    ? FontWeight.bold
+                                    : FontWeight.w500,
+                              ),
                             ),
                           ),
-                        ),
-                      ],
+                        ],
+                      ),
                     ),
                   ),
                 ),

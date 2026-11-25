@@ -100,8 +100,16 @@ List<SegmentMark> segmentMarksFor(SegmentsState state, int durationMs) {
 }
 
 /// 进度条轨道：默认圆角轨道之上叠画片段色块（滑点仍画在最上层）。
+///
+/// 「本地缓存进度」**不在这里画**：它走 Slider 原生的 `secondaryTrackValue`
+///（`secondaryActiveTrackColor`），即「滑点 → 前沿」那一段。原因是框架缺陷：
+/// `_RenderSlider` 的 `sliderTheme` setter 只更新 label painter，**不调用
+/// `markNeedsPaint()`** —— 把缓存带塞进 trackShape 时，只有播放位置变了才会重绘，
+/// 一暂停就永远停在那儿；而 `secondaryTrackValue` 的 setter 有 `markNeedsPaint()`，
+/// 暂停时缓存推进也能实时重画。
 class SegmentTrackShape extends RoundedRectSliderTrackShape {
   const SegmentTrackShape(this.marks);
+
   final List<SegmentMark> marks;
 
   @override
@@ -144,7 +152,8 @@ class SegmentTrackShape extends RoundedRectSliderTrackShape {
   }
 
   @override
-  bool operator ==(Object other) => other is SegmentTrackShape && listEquals(other.marks, marks);
+  bool operator ==(Object other) =>
+      other is SegmentTrackShape && listEquals(other.marks, marks);
 
   @override
   int get hashCode => Object.hashAll(marks);

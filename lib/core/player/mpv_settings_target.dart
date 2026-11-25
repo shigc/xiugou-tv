@@ -1,4 +1,6 @@
 import 'package:media_kit/media_kit.dart';
+import 'package:path/path.dart' as p;
+
 import 'player_settings_application.dart';
 
 /// 数值化解析 mpv 宽高比取值：支持浮点（`1.777778`）与 `W:H`（`16:9`）。
@@ -35,6 +37,13 @@ class MpvSettingsTarget implements PlayerSettingsTarget {
 
   @override
   Future<void> setProperty(String name, String value) async {
+    // 画质增强着色器：Windows 绝对路径含冒号，mpv 会把 `glsl-shaders` 的
+    // 字符串按列表分隔符（`:`）误拆，故改用 `change-list ... set <path>`
+    // 逐个传入；空串表示清除，无冒号可直接 set。
+    if (name == 'glsl-shaders') {
+      await _applyGlslShaders(value);
+      return;
+    }
     await _native.setProperty(name, value);
     final actual = await _native.getProperty(name);
     // mpv 将旧 audio-channels=auto 规范化为 auto-safe。
@@ -50,6 +59,29 @@ class MpvSettingsTarget implements PlayerSettingsTarget {
       }
     }
     _verify(name, value, actual);
+  }
+
+  /// 注入 / 清除画质增强着色器。
+  ///
+  /// mpv 的 `glsl-shaders` 是列表属性，回读为逗号分隔的路径串且会归一化分隔符，
+  /// 无法做精确匹配；此处只做「是否生效」的宽松确认。
+  Future<void> _applyGlslShaders(String value) async {
+    if (value.isEmpty) {
+      // 清除：空串无冒号，可直接 set。
+      await _native.setProperty('glsl-shaders', '');
+      final actual = await _native.getProperty('glsl-shaders');
+      if (actual.isNotEmpty) {
+        throw StateError('glsl-shaders 未清除（回读 $actual）');
+      }
+      return;
+    }
+    // 含绝对路径（带冒号），用 change-list 逐个传入，避开 mpv 的 `:` 列表分隔。
+    await _native.command(['change-list', 'glsl-shaders', 'set', value]);
+    final actual = await _native.getProperty('glsl-shaders');
+    final expectedName = p.basename(value);
+    if (actual.isEmpty || !actual.contains(expectedName)) {
+      throw StateError('glsl-shaders 未确认（期望含 $expectedName，回读 $actual）');
+    }
   }
 
   @override

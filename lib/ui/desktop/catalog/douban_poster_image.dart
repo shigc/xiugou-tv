@@ -7,6 +7,8 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/painting.dart';
 
 import '../../../core/api/douban_repository.dart';
+import '../../../core/cache/poster_cache_store.dart';
+import '../../../core/diagnostics/app_logger.dart';
 import '../../../core/net/http_client_factory.dart';
 
 /// 豆瓣海报解码器（§17）。
@@ -80,6 +82,7 @@ class DoubanPosterImage extends ImageProvider<DoubanPosterImage> {
         }
       }
       scheduleMicrotask(() => PaintingBinding.instance.imageCache.evict(key));
+      AppLogger.instance.debug('poster', '豆瓣海报加载失败：$url（$lastError）');
       throw StateError('豆瓣海报加载失败：$url（$lastError）');
     } finally {
       // 这一层不消费进度事件，立即关闭避免泄漏
@@ -123,6 +126,30 @@ class DoubanPosterImage extends ImageProvider<DoubanPosterImage> {
       if (fallbackUrl != null && fallbackUrl != url)
         ...candidateUrls(fallbackUrl),
     ].where(seen.add).toList(growable: false);
+  }
+
+  /// 先要 `.webp`；失败（404 / 非 200）再回落原地址；高清地址整轮失败后
+  /// 再试 [fallbackUrl] 的候选，最后才交给占位图。
+  Future<Uint8List> _fetch() async {
+    // 磁盘缓存命中就直接用，不再走网络（上游 v1.0.4 无此层，属本地独有）
+    final cached = await PosterCacheStore.instance.read(url);
+    if (cached != null) return cached;
+    final candidates = fetchCandidates(url: url, fallbackUrl: fallbackUrl);
+    Object? lastError;
+    for (final candidate in candidates) {
+      try {
+        final bytes = await _get(candidate);
+        if (bytes.isNotEmpty) {
+          unawaited(PosterCacheStore.instance.write(url, bytes));
+          return bytes;
+        }
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    // 线上失败会走占位图；这里只留 debug 级日志（不刷控制台，但可在设置页筛选查看）。
+    AppLogger.instance.debug('poster', '豆瓣海报加载失败：$url（$lastError）');
+    throw StateError('豆瓣海报加载失败：$url（$lastError）');
   }
 
   static Future<Uint8List> _get(String url) async {

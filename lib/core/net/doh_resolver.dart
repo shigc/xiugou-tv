@@ -1,9 +1,9 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:developer' as developer;
 import 'dart:io';
 import 'dart:typed_data';
 
+import '../diagnostics/app_logger.dart';
 import '../diagnostics/error_log.dart';
 
 /// 系统 DNS 查询（可注入以便测试）
@@ -55,10 +55,9 @@ class DohResolver {
   final _pending = <String, Future<List<InternetAddress>>>{};
   final _failedUntil = <String, DateTime>{};
 
-  /// 诊断日志：开发日志 + 「关于 → 错误日志」（仅内存，便于用户反馈时查看）
+  /// 诊断日志：同时进统一分级日志（warning）与「关于 → 错误日志」（内存视图）。
   static void _defaultLog(String message) {
-    developer.log(message, name: 'xiugou-tv::doh');
-    ErrorLog.instance.record('安全 DNS', message);
+    ErrorLog.instance.record('安全 DNS', message, null, AppLogLevel.warning);
   }
 
   /// 解析主机名；返回非空地址列表，系统 DNS 也失败时抛 [SocketException]。

@@ -5,6 +5,7 @@ import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
 
+import '../diagnostics/app_logger.dart';
 import '../net/http_client_factory.dart';
 import '../storage/data_directory_manager.dart';
 import 'companion_log.dart';
@@ -96,7 +97,8 @@ class CompanionProcessManager implements CompanionRecoveryHost {
     final process = await Process.start(executable, arguments);
     final adopted = await ProcessJob.adopt(process.pid);
     if (!adopted) {
-      debugPrint('[companion] 未能加入进程 Job（pid=${process.pid}），退出兜底仅依赖看门狗');
+      AppLogger.instance.warning(
+          'companion', '未能加入进程 Job（pid=${process.pid}），退出兜底仅依赖看门狗');
     }
     return process;
   }
@@ -345,14 +347,17 @@ class CompanionProcessManager implements CompanionRecoveryHost {
             'Java Runtime Environment (JRE) >= $minimumJavaMajorVersion '
             'not found in runtime/jre, APPDATA, JAVA_HOME or PATH.';
         _log.write('[start] 失败：$_lastError');
+        AppLogger.instance.error('companion', '未能启动：未找到 Java 运行时',
+            error: _lastError);
         return false;
       }
       if (!File(resolvedJar).existsSync()) {
         throw StateError('Companion service jar not found at $resolvedJar');
       }
       _log.write('[start] java=$javaCmd jar=$resolvedJar port=$targetPort');
+      AppLogger.instance.info('companion', '正在启动 companion（port=$targetPort, java=$javaCmd）');
       if (debugCompanion) {
-        debugPrint('[companion] runtime java=$javaCmd jar=$resolvedJar');
+        AppLogger.instance.debug('companion', 'jar=$resolvedJar');
       }
       final ready = Completer<int?>();
       String? fallback;
@@ -403,13 +408,14 @@ class CompanionProcessManager implements CompanionRecoveryHost {
           .transform(const Utf8Decoder(allowMalformed: true))
           .transform(const LineSplitter())
           .listen((line) {
-        if (debugCompanion) debugPrint('[companion] $line');
+        if (debugCompanion) AppLogger.instance.debug('companion', line);
         final trimmed = line.trim();
         if (trimmed.isEmpty) return;
         final match = RegExp(r'^\[COMPANION_READY\] PORT=(\d+)$').firstMatch(trimmed);
         final port = int.tryParse(match?.group(1) ?? '');
         if (port != null && port > 0 && port <= 65535 && !ready.isCompleted) {
           _log.write('[ready] port=$port');
+          AppLogger.instance.info('companion', 'companion 就绪（port=$port）');
           ready.complete(port);
         } else if (debugCompanion) {
           _log.write('[stdout] $trimmed');
@@ -432,22 +438,28 @@ class CompanionProcessManager implements CompanionRecoveryHost {
         // 这里折叠成一行再转发，避免 debug 控制台被「看起来像崩了」的堆栈刷满。
         for (final folded in _stderrFilter.feed(line)) {
           _log.write('[stderr] $folded');
-          if (debugCompanion) debugPrint('[companion:err] $folded');
+          if (debugCompanion) AppLogger.instance.debug('companion', folded);
         }
         final meaningful = _stderrFilter.lastMeaningfulLine;
         if (meaningful != null) _lastError = meaningful;
       }, onError: (Object error) {
         _lastError = '$error';
         _log.write('[stderr] 读取失败：$error');
-        if (debugCompanion) debugPrint('[companion:err] $error');
+        AppLogger.instance.warning('companion', 'stderr 读取失败', error: error);
       }, onDone: () {
         for (final folded in _stderrFilter.flush()) {
           _log.write('[stderr] $folded');
-          if (debugCompanion) debugPrint('[companion:err] $folded');
+          if (debugCompanion) AppLogger.instance.debug('companion', folded);
         }
       });
       unawaited(process.exitCode.then((code) {
         _log.write('[exit] code=$code pid=${process.pid}');
+        final message = 'companion 进程退出（code=$code, pid=${process.pid}）';
+        if (code == 0) {
+          AppLogger.instance.info('companion', message);
+        } else {
+          AppLogger.instance.warning('companion', message);
+        }
         if (!ready.isCompleted) ready.complete(null);
         if (identical(_process, process)) {
           _disarmIdleWatch();
@@ -482,10 +494,12 @@ class CompanionProcessManager implements CompanionRecoveryHost {
       _lastActivity = DateTime.now();
       _armIdleWatch();
       _log.write('[start] 就绪 port=$port');
+      AppLogger.instance.info('companion', 'companion 健康检查通过，启动完成');
       return true;
     } catch (error) {
       _lastError = '$error';
       _log.write('[start] 失败：$error');
+      AppLogger.instance.error('companion', '启动失败', error: error);
       if (!_stopRequested) {
         try {
           await _terminateProcess();
@@ -536,7 +550,7 @@ class CompanionProcessManager implements CompanionRecoveryHost {
     _activeLeases++;
     _lastActivity = DateTime.now();
     if (_debugFromDefine) {
-      debugPrint('[companion] 租约申请（$reason），当前 $_activeLeases');
+      AppLogger.instance.debug('companion', '租约申请（$reason），当前 $_activeLeases');
     }
     return CompanionLease._(this, reason);
   }
@@ -547,7 +561,7 @@ class CompanionProcessManager implements CompanionRecoveryHost {
     // 释放时重置计时：释放后仍要完整等满 idleTimeout 才允许回收。
     _lastActivity = DateTime.now();
     if (_debugFromDefine) {
-      debugPrint('[companion] 租约释放（$reason），剩余 $_activeLeases');
+      AppLogger.instance.debug('companion', '租约释放（$reason），剩余 $_activeLeases');
     }
   }
 
@@ -649,7 +663,7 @@ class CompanionProcessManager implements CompanionRecoveryHost {
       _lastError = 'companion 进程在 ${exitTimeout.inMilliseconds}ms 内未退出'
           '（pid=${process.pid}），已尝试终止进程树';
       _log.write('[stop] $_lastError');
-      debugPrint('[companion] $_lastError');
+      AppLogger.instance.warning('companion', _lastError);
     }
   }
 

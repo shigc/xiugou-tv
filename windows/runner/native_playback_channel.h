@@ -1,6 +1,7 @@
 #ifndef RUNNER_NATIVE_PLAYBACK_CHANNEL_H_
 #define RUNNER_NATIVE_PLAYBACK_CHANNEL_H_
 
+#include <flutter/flutter_engine.h>
 #include <flutter/method_channel.h>
 #include <flutter_windows.h>
 
@@ -11,7 +12,7 @@ namespace native_playback {
 class PlaybackChannel {
  public:
   PlaybackChannel(flutter::BinaryMessenger* messenger, FlutterDesktopPluginRegistrarRef registrar,
-                  HWND runner);
+                  flutter::FlutterEngine* engine, HWND runner);
   ~PlaybackChannel();
   PlaybackChannel(const PlaybackChannel&) = delete;
   PlaybackChannel& operator=(const PlaybackChannel&) = delete;

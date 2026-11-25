@@ -1,4 +1,4 @@
-import 'package:flutter/foundation.dart' show debugPrint;
+import '../diagnostics/app_logger.dart';
 
 import '../danmaku/danmaku_matcher.dart' show EpisodeNumber;
 
@@ -59,7 +59,8 @@ List<T> naturalEpisodeList<T>(
     title: title,
   );
   if (order == null) return episodes;
-  debugPrint('--> [选集整理] site=${siteKey ?? '-'} vod=${title ?? '-'} '
-      'line=${lineName ?? '-'} count=${episodes.length}：源顺序乱序，按集号重排');
+  AppLogger.instance.debug('episodes', 'site=${siteKey ?? '-'} '
+      'vod=${title ?? '-'} line=${lineName ?? '-'} '
+      'count=${episodes.length}：源顺序乱序，按集号重排');
   return [for (final i in order) episodes[i]];
 }

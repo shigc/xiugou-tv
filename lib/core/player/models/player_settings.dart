@@ -1,6 +1,7 @@
 import '../../danmaku/danmaku_settings.dart';
 import '../../settings/models/external_player_settings.dart';
 import '../../settings/models/player_shortcut_bindings.dart';
+import '../shader_resources.dart';
 
 /// 可选项：显示名 + mpv 取值
 class PlayerOption {
@@ -29,6 +30,15 @@ class PlayerSettings {
 
   /// 音画同步偏置（毫秒，正值表示音频延后）
   final int audioDelayMs;
+
+  /// 字幕同步偏置（毫秒，正值表示字幕延后出现）。mpv `sub-delay`。
+  final int subtitleDelayMs;
+
+  /// 字幕字号倍率 (0.3 ~ 3.0)。mpv `sub-scale`。
+  final double subtitleScale;
+
+  /// 字幕垂直位置：`sub-pos`，100 = 随包 libmpv 的出厂默认（贴底），越小越靠上。
+  final int subtitlePosition;
 
   /// mpv `tone-mapping`：HDR → SDR 色调映射算法
   final String toneMapping;
@@ -106,12 +116,23 @@ class PlayerSettings {
   /// 鼠标静止多久后隐藏光标（§55 口径：5 秒）。
   static const Duration cursorIdleDelay = Duration(seconds: 5);
 
+  /// 画质增强（超分辨率）总开关：开启时把内置着色器注入 libmpv 实时增强。
+  /// 默认 false；着色器文件缺失时（开发期未随包分发）会静默失效而不报错。
+  final bool superResolutionEnabled;
+
+  /// 画质增强强度档位：'soft' 轻量（性能优先）/ 'strong' 画质（推荐）。
+  /// 默认 'strong'；非法值回落 'strong'。
+  final String superResolutionStrength;
+
   const PlayerSettings({
     this.hwdec = 'auto-safe',
     this.defaultVolume = 100,
     this.defaultRate = 1.0,
     this.audioChannels = 'auto',
     this.audioDelayMs = 0,
+    this.subtitleDelayMs = 0,
+    this.subtitleScale = 1.0,
+    this.subtitlePosition = 100,
     this.toneMapping = 'auto',
     this.scale = 'fit',
     this.brightness = 0,
@@ -133,6 +154,8 @@ class PlayerSettings {
     this.autoHideCursor = true,
     this.browserHeaders = true,
     this.autoDetectLiveDirectMode = true,
+    this.superResolutionEnabled = false,
+    this.superResolutionStrength = 'strong',
   });
 
   static const PlayerSettings defaults = PlayerSettings();
@@ -180,10 +203,35 @@ class PlayerSettings {
   static const List<double> holdRateOptions = [2.0, 3.0, 4.0];
   static const double defaultHoldRate = 3.0;
 
+  /// 画质增强强度档位（对应 [ShaderResources.strengthFiles] 的键）。
+  static const List<PlayerOption> superResolutionStrengthOptions = [
+    PlayerOption('soft', '轻量（性能优先）'),
+    PlayerOption('strong', '画质（推荐）'),
+  ];
+
+  /// 画质增强强度档位白名单校验：非法或缺失值回落 'strong'。
+  static String normalizeSuperResolutionStrength(String? raw) {
+    final value = raw?.trim().toLowerCase();
+    return value != null && _allowed(superResolutionStrengthOptions, value)
+        ? value
+        : 'strong';
+  }
+
   static const double minRate = 0.5;
   static const double maxRate = 3.0;
   static const int minAudioDelayMs = -5000;
   static const int maxAudioDelayMs = 5000;
+
+  /// 字幕三项的默认值 = 随包 libmpv 的出厂值（实测 media_kit 自带的
+  /// `mpv-dev-x86_64-20230924`：`sub-delay=0.000000`、`sub-scale=1.000000`、
+  /// `sub-pos=100.000000`）。默认即「写了也和没写一样」，保证不开启该功能时
+  /// 字幕外观与改动前零差异——与 `video-aspect-override` 复位值同一取舍。
+  static const int minSubtitleDelayMs = -10000;
+  static const int maxSubtitleDelayMs = 10000;
+  static const double minSubtitleScale = 0.3;
+  static const double maxSubtitleScale = 3.0;
+  static const int minSubtitlePosition = 0;
+  static const int maxSubtitlePosition = 100;
   static const int minCacheSecs = 5;
   static const int maxCacheSecs = 300;
   static const int minPicture = -100;
@@ -230,6 +278,12 @@ class PlayerSettings {
       defaultRate: number('defaultRate', 1.0, minRate, maxRate),
       audioChannels: pick('audioChannels', audioChannelOptions, 'auto'),
       audioDelayMs: integer('audioDelayMs', 0, minAudioDelayMs, maxAudioDelayMs),
+      subtitleDelayMs: integer(
+          'subtitleDelayMs', 0, minSubtitleDelayMs, maxSubtitleDelayMs),
+      subtitleScale:
+          number('subtitleScale', 1.0, minSubtitleScale, maxSubtitleScale),
+      subtitlePosition: integer(
+          'subtitlePosition', 100, minSubtitlePosition, maxSubtitlePosition),
       toneMapping: pick('toneMapping', toneMappingOptions, 'auto'),
       scale: pick('scale', scaleOptions, 'fit'),
       brightness: integer('brightness', 0, minPicture, maxPicture),
@@ -252,6 +306,10 @@ class PlayerSettings {
       autoHideCursor: json['autoHideCursor'] != false,
       browserHeaders: json['browserHeaders'] != false,
       autoDetectLiveDirectMode: json['autoDetectLiveDirectMode'] != false,
+      // 画质增强默认关闭：只有显式 true 才开启。
+      superResolutionEnabled: json['superResolutionEnabled'] == true,
+      superResolutionStrength:
+          normalizeSuperResolutionStrength(json['superResolutionStrength']),
     );
   }
 
@@ -266,6 +324,9 @@ class PlayerSettings {
         'defaultRate': defaultRate,
         'audioChannels': audioChannels,
         'audioDelayMs': audioDelayMs,
+        'subtitleDelayMs': subtitleDelayMs,
+        'subtitleScale': subtitleScale,
+        'subtitlePosition': subtitlePosition,
         'toneMapping': toneMapping,
         'scale': scale,
         'brightness': brightness,
@@ -287,6 +348,8 @@ class PlayerSettings {
         'autoHideCursor': autoHideCursor,
         'browserHeaders': browserHeaders,
         'autoDetectLiveDirectMode': autoDetectLiveDirectMode,
+        'superResolutionEnabled': superResolutionEnabled,
+        'superResolutionStrength': superResolutionStrength,
       };
 
   /// 画面缩放对应的 mpv 属性取值：比例模式强制对应比例，其余复位默认态。
@@ -304,6 +367,9 @@ class PlayerSettings {
         'hwdec': hwdec,
         'audio-channels': audioChannels,
         'audio-delay': (audioDelayMs / 1000).toStringAsFixed(3),
+        'sub-delay': (subtitleDelayMs / 1000).toStringAsFixed(3),
+        'sub-scale': subtitleScale.toStringAsFixed(2),
+        'sub-pos': '$subtitlePosition',
         'tone-mapping': toneMapping,
         'video-aspect-override': mpvAspectOverride,
         'brightness': '$brightness',
@@ -311,6 +377,14 @@ class PlayerSettings {
         'saturation': '$saturation',
         'gamma': '$gamma',
         'cache-secs': '$cacheSecs',
+        // 画质增强：开启时注入内置着色器绝对路径；关闭或文件缺失时置空（引擎侧视为清除）。
+        // 注意：Windows 绝对路径含冒号，不能走 mpv 的 `:` 列表分隔，由
+        // MpvSettingsTarget.setProperty 改用 `change-list glsl-shaders set` 注入。
+        'glsl-shaders': superResolutionEnabled
+            ? (ShaderResources.resolveSuperResolutionShader(
+                superResolutionStrength) ??
+                '')
+            : '',
       };
 
   /// 经 JSON 往返的规范化副本（用于对 UI 输入做同样的校验）
@@ -322,6 +396,9 @@ class PlayerSettings {
     double? defaultRate,
     String? audioChannels,
     int? audioDelayMs,
+    int? subtitleDelayMs,
+    double? subtitleScale,
+    int? subtitlePosition,
     String? toneMapping,
     String? scale,
     int? brightness,
@@ -343,6 +420,8 @@ class PlayerSettings {
     bool? autoHideCursor,
     bool? browserHeaders,
     bool? autoDetectLiveDirectMode,
+    bool? superResolutionEnabled,
+    String? superResolutionStrength,
   }) {
     return PlayerSettings(
       hwdec: hwdec ?? this.hwdec,
@@ -350,6 +429,9 @@ class PlayerSettings {
       defaultRate: defaultRate ?? this.defaultRate,
       audioChannels: audioChannels ?? this.audioChannels,
       audioDelayMs: audioDelayMs ?? this.audioDelayMs,
+      subtitleDelayMs: subtitleDelayMs ?? this.subtitleDelayMs,
+      subtitleScale: subtitleScale ?? this.subtitleScale,
+      subtitlePosition: subtitlePosition ?? this.subtitlePosition,
       toneMapping: toneMapping ?? this.toneMapping,
       scale: scale ?? this.scale,
       brightness: brightness ?? this.brightness,
@@ -372,6 +454,10 @@ class PlayerSettings {
       browserHeaders: browserHeaders ?? this.browserHeaders,
       autoDetectLiveDirectMode:
           autoDetectLiveDirectMode ?? this.autoDetectLiveDirectMode,
+      superResolutionEnabled:
+          superResolutionEnabled ?? this.superResolutionEnabled,
+      superResolutionStrength:
+          superResolutionStrength ?? this.superResolutionStrength,
     );
   }
 
@@ -383,6 +469,9 @@ class PlayerSettings {
       other.defaultRate == defaultRate &&
       other.audioChannels == audioChannels &&
       other.audioDelayMs == audioDelayMs &&
+      other.subtitleDelayMs == subtitleDelayMs &&
+      other.subtitleScale == subtitleScale &&
+      other.subtitlePosition == subtitlePosition &&
       other.toneMapping == toneMapping &&
       other.scale == scale &&
       other.brightness == brightness &&
@@ -403,11 +492,15 @@ class PlayerSettings {
       other.externalPlayer == externalPlayer &&
       other.autoHideCursor == autoHideCursor &&
       other.browserHeaders == browserHeaders &&
-      other.autoDetectLiveDirectMode == autoDetectLiveDirectMode;
+      other.autoDetectLiveDirectMode == autoDetectLiveDirectMode &&
+      other.superResolutionEnabled == superResolutionEnabled &&
+      other.superResolutionStrength == superResolutionStrength;
 
   @override
-  int get hashCode => Object.hashAll([hwdec, defaultVolume, defaultRate, audioChannels, audioDelayMs,
-      toneMapping, scale, brightness, contrast, saturation, gamma, cacheSecs, hideWindowTitleBar,
-      danmakuEnabled, danmaku, segmentsAutoApply, showMiniProgress, showResolution, autoLineSwitch, autoPlayNextEpisode, holdRate, shortcuts,
-      externalPlayer, autoHideCursor, browserHeaders, autoDetectLiveDirectMode]);
+  int get hashCode => Object.hashAll([hwdec, defaultVolume, defaultRate, audioChannels,
+      audioDelayMs, subtitleDelayMs, subtitleScale, subtitlePosition, toneMapping, scale,
+      brightness, contrast, saturation, gamma, cacheSecs, hideWindowTitleBar, danmakuEnabled,
+      danmaku, segmentsAutoApply, showMiniProgress, showResolution, autoLineSwitch,
+      autoPlayNextEpisode, holdRate, shortcuts, externalPlayer, autoHideCursor, browserHeaders,
+      autoDetectLiveDirectMode, superResolutionEnabled, superResolutionStrength]);
 }

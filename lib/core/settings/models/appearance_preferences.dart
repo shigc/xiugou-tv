@@ -22,8 +22,8 @@ enum AppThemeMode {
 /// 外观偏好：主题 + 壁纸（SET-08 / 主题）。
 ///
 /// 持久化于应用数据目录的 `appearance_preferences.json`。
-/// **version 2** 起新增 `themeMode`；读取时兼容 version 1（视为深色），
-/// 写入一律为 version 2。
+/// **version 2** 起新增 `themeMode`；**version 3** 起新增 `themePreset`（配色主题）。
+/// 读取时兼容 version 1/2（缺省值：深色 + 经典蓝灰），写入一律为 version 3。
 ///
 /// 壁纸只存**文件名**（形如 `current.jpg`）：图片本体由 `WallpaperStore`
 /// 复制到 `wallpaper/` 子目录，因此用户移动 / 删除原图不会让壁纸失效；
@@ -31,10 +31,10 @@ enum AppThemeMode {
 ///
 /// 读取规则：版本 / 顶层结构 / 字段类型非法时抛出 [FormatException]（调用方保留原文件）。
 class AppearancePreferences {
-  static const int formatVersion = 2;
+  static const int formatVersion = 3;
 
-  /// 可读取的历史版本：1 没有主题字段（按深色处理）。
-  static const Set<int> readableVersions = {1, 2};
+  /// 可读取的历史版本：1 没有主题字段（按深色处理）；2 没有 themePreset（按经典处理）。
+  static const Set<int> readableVersions = {1, 2, 3};
 
   /// 文件名允许的字符集：不含路径分隔符，配合 `WallpaperStore` 的目录约束。
   static final RegExp fileNamePattern = RegExp(r'^[A-Za-z0-9][A-Za-z0-9._-]*$');
@@ -47,11 +47,17 @@ class AppearancePreferences {
   final bool sidebarCollapsed;
   final TmdbPreferences tmdb;
 
+  /// 配色主题（色相预设）的持久化键；默认经典蓝灰。
+  ///
+  /// 非法 / 缺失值会在读取时回退默认（见 [themePresetByName]），这里只负责原样存储。
+  final String themePreset;
+
   const AppearancePreferences({
     this.wallpaperFileName,
     this.themeMode = AppThemeMode.dark,
     this.sidebarCollapsed = false,
     this.tmdb = const TmdbPreferences(),
+    this.themePreset = 'classic',
   });
 
   /// 未设置壁纸（默认外观）。
@@ -65,6 +71,7 @@ class AppearancePreferences {
         tmdb: tmdb,
         themeMode: themeMode,
         sidebarCollapsed: sidebarCollapsed,
+        themePreset: themePreset,
       );
 
   AppearancePreferences withThemeMode(AppThemeMode mode) => AppearancePreferences(
@@ -72,6 +79,7 @@ class AppearancePreferences {
         themeMode: mode,
         tmdb: tmdb,
         sidebarCollapsed: sidebarCollapsed,
+        themePreset: themePreset,
       );
 
   AppearancePreferences withSidebarCollapsed(bool value) => AppearancePreferences(
@@ -79,6 +87,7 @@ class AppearancePreferences {
         themeMode: themeMode,
         sidebarCollapsed: value,
         tmdb: tmdb,
+        themePreset: themePreset,
       );
 
   AppearancePreferences withTmdb(TmdbPreferences value) => AppearancePreferences(
@@ -86,6 +95,15 @@ class AppearancePreferences {
         themeMode: themeMode,
         sidebarCollapsed: sidebarCollapsed,
         tmdb: value,
+        themePreset: themePreset,
+      );
+
+  AppearancePreferences withThemePreset(String preset) => AppearancePreferences(
+        wallpaperFileName: wallpaperFileName,
+        themeMode: themeMode,
+        sidebarCollapsed: sidebarCollapsed,
+        tmdb: tmdb,
+        themePreset: preset,
       );
 
   static AppearancePreferences fromJson(Map<String, dynamic> json) {
@@ -112,8 +130,20 @@ class AppearancePreferences {
       throw const FormatException('外观偏好格式无效');
     }
     final sidebarCollapsed = rawCollapsed == true;
+
+    // version 1/2 没有该字段：按经典蓝灰处理；缺失的 version 3 同样回退默认。
+    String themePreset = 'classic';
+    final rawPreset = json['themePreset'];
+    if (rawPreset != null) {
+      if (rawPreset is! String) throw const FormatException('外观偏好格式无效');
+      final preset = rawPreset.trim();
+      if (preset.isNotEmpty) themePreset = preset;
+    }
+
     final raw = json['wallpaperFileName'];
-    if (raw != null && raw is! String) throw const FormatException('外观偏好格式无效');
+    if (raw != null && raw is! String) {
+      throw const FormatException('外观偏好格式无效');
+    }
     final name = (raw as String?)?.trim() ?? '';
     if (name.isNotEmpty && !fileNamePattern.hasMatch(name)) {
       throw const FormatException('外观偏好格式无效');
@@ -123,6 +153,7 @@ class AppearancePreferences {
       themeMode: themeMode,
       sidebarCollapsed: sidebarCollapsed,
       tmdb: TmdbPreferences.fromJson(json['tmdb']),
+      themePreset: themePreset,
     );
   }
 
@@ -132,19 +163,24 @@ class AppearancePreferences {
         'themeMode': themeMode.name,
         'sidebarCollapsed': sidebarCollapsed,
         if (tmdb != const TmdbPreferences()) 'tmdb': tmdb.toJson(),
+        'themePreset': themePreset,
       };
 
   @override
   bool operator ==(Object other) =>
       other is AppearancePreferences &&
       other.wallpaperFileName == wallpaperFileName &&
-      other.themeMode == themeMode && other.sidebarCollapsed == sidebarCollapsed && other.tmdb == tmdb;
+      other.themeMode == themeMode &&
+      other.sidebarCollapsed == sidebarCollapsed &&
+      other.tmdb == tmdb &&
+      other.themePreset == themePreset;
 
   @override
-  int get hashCode => Object.hash(wallpaperFileName, themeMode, sidebarCollapsed, tmdb);
+  int get hashCode =>
+      Object.hash(wallpaperFileName, themeMode, sidebarCollapsed, tmdb, themePreset);
 
   @override
   String toString() =>
       'AppearancePreferences(wallpaperFileName: $wallpaperFileName, '
-      'themeMode: ${themeMode.name}, sidebarCollapsed: $sidebarCollapsed)';
+      'themeMode: ${themeMode.name}, sidebarCollapsed: $sidebarCollapsed, themePreset: $themePreset)';
 }

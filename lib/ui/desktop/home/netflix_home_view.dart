@@ -57,6 +57,12 @@ class NetflixHomeView extends StatefulWidget {
   final Future<String?> Function(VodItem item)? synopsisFor;
   final bool isLoading;
 
+  /// 加载失败原因（宿主传入）；为空表示没有失败。
+  final String? errorMessage;
+
+  /// 失败 / 空态上的「重试」动作（宿主的 loadSiteData）。
+  final VoidCallback? onRetry;
+
   /// 垂直滚动控制器（外部传入时由外部持有；用于触底续页判断）。
   final ScrollController? scrollController;
 
@@ -74,12 +80,89 @@ class NetflixHomeView extends StatefulWidget {
     this.stillUrlFor,
     this.synopsisFor,
     this.isLoading = false,
+    this.errorMessage,
+    this.onRetry,
     this.scrollController,
     this.onScrollNotification,
   });
 
   @override
   State<NetflixHomeView> createState() => _NetflixHomeViewState();
+}
+
+/// 首页的失败态 / 空态。
+///
+/// 过去失败或没数据时，Hero 与每个分类行都被 `if (isNotEmpty)` 跳过，
+/// 整页只剩两个 SizedBox——用户看到的是一片空白，分不清是加载失败还是真没内容，
+/// 也没有任何恢复入口。
+class _NetflixStatusView extends StatelessWidget {
+  const _NetflixStatusView({
+    required this.icon,
+    required this.tone,
+    required this.title,
+    required this.message,
+    this.actionLabel,
+    this.onAction,
+  });
+
+  final IconData icon;
+  final Color tone;
+  final String title;
+  final String message;
+  final String? actionLabel;
+  final VoidCallback? onAction;
+
+  @override
+  Widget build(BuildContext context) {
+    final palette = AppPalette.of(context);
+    return Center(
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 460),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: 64,
+              height: 64,
+              decoration: BoxDecoration(
+                color: tone.withValues(alpha: 0.12),
+                borderRadius: BorderRadius.circular(AppRadii.pill),
+                border:
+                    Border.all(color: tone.withValues(alpha: 0.35), width: 1),
+              ),
+              child: Icon(icon, size: 28, color: tone),
+            ),
+            const SizedBox(height: 16),
+            Text(
+              title,
+              style: TextStyle(
+                color: palette.textMain,
+                fontSize: AppType.body,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              message,
+              textAlign: TextAlign.center,
+              style: TextStyle(color: palette.textSub, fontSize: AppType.body),
+            ),
+            if (actionLabel != null && onAction != null) ...[
+              const SizedBox(height: 20),
+              FocusOutline(
+                radius: AppRadii.pill,
+                child: OutlinedButton.icon(
+                  onPressed: onAction,
+                  icon: const Icon(Icons.refresh_rounded, size: 16),
+                  label: Text(actionLabel!),
+                ),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
 }
 
 class _NetflixHomeViewState extends State<NetflixHomeView> {
@@ -117,6 +200,9 @@ class _NetflixHomeViewState extends State<NetflixHomeView> {
   Widget build(BuildContext context) {
     final palette = AppPalette.of(context);
     final billboardItems = _extractBillboardItems();
+    final hasContent = billboardItems.isNotEmpty ||
+        widget.categories.any((c) =>
+            (widget.categoryItemsMap[c.id] ?? const <VodItem>[]).isNotEmpty);
 
     if (widget.isLoading && billboardItems.isEmpty) {
       return Center(
@@ -145,6 +231,28 @@ class _NetflixHomeViewState extends State<NetflixHomeView> {
             ),
           ],
         ),
+      );
+    }
+
+    // 三态齐全：加载 → 失败（可重试）→ 空（可刷新）
+    if (!widget.isLoading && widget.errorMessage != null) {
+      return _NetflixStatusView(
+        icon: Icons.wifi_off_rounded,
+        tone: palette.danger,
+        title: '内容加载失败',
+        message: widget.errorMessage!,
+        actionLabel: '重试',
+        onAction: widget.onRetry,
+      );
+    }
+    if (!widget.isLoading && !hasContent) {
+      return _NetflixStatusView(
+        icon: Icons.movie_outlined,
+        tone: palette.textSub,
+        title: '这里还没有内容',
+        message: '当前来源没有返回任何影片，换个站源或稍后再试',
+        actionLabel: '刷新',
+        onAction: widget.onRetry,
       );
     }
 
